@@ -1,0 +1,44 @@
+name: PR 283 conflict inventory
+on:
+  push:
+    branches:
+      - ci/pr283-verification
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/durable-recovery-links-model-sync
+          fetch-depth: 0
+      - name: Attempt merge without committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/Dicklesworthstone/pi_agent_rust.git
+          git fetch upstream main
+          echo "BASE_REF=$(git rev-parse HEAD)"
+          echo "UPSTREAM_REF=$(git rev-parse upstream/main)"
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name "GitHub Actions"
+          git merge --no-commit --no-ff upstream/main || true
+          mkdir -p conflict-inventory
+          git status --porcelain=v1 > conflict-inventory/status.txt
+          git diff --name-only --diff-filter=U > conflict-inventory/conflicts.txt
+          git ls-files -u > conflict-inventory/stages.txt
+          git diff --cc > conflict-inventory/combined.diff
+          echo "=== Unmerged paths ==="
+          cat conflict-inventory/conflicts.txt
+          echo "=== Staged conflicts ==="
+          cat conflict-inventory/stages.txt
+          echo "=== Combined conflict diff ==="
+          head -n 180 conflict-inventory/combined.diff
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr283-conflict-inventory
+          path: conflict-inventory/
+          retention-days: 7
