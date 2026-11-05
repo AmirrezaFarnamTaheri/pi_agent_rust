@@ -1,0 +1,70 @@
+name: PR 283 evidence (isolated)
+on:
+  push:
+    branches:
+      - ci/pr283-verification
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+      PI_TEST_MODE: "1"
+      VCR_MODE: playback
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+      - name: Run and capture requested gates
+        shell: bash
+        run: |
+          mkdir -p pr283-evidence
+          run_gate() {
+            local label="$1"
+            shift
+            set +e
+            "$@" >"pr283-evidence/${label}.log" 2>&1
+            local code=$?
+            set -e
+            printf '%s\t%s\t' "$label" "$code" >>pr283-evidence/results.tsv
+            printf '%q ' "$@" >>pr283-evidence/results.tsv
+            printf '\n' >>pr283-evidence/results.tsv
+            echo "::notice::${label} finished with exit code ${code}"
+          }
+          set -e
+          printf 'gate\texit_code\tcommand\n' >pr283-evidence/results.tsv
+          run_gate fmt cargo fmt --all -- --check
+          run_gate unit cargo test --all-targets
+          run_gate extension cargo test --all-targets --features ext-conformance
+          run_gate clippy cargo clippy --all-targets --all-features -- -D warnings
+          run_gate e2e bash ./scripts/e2e/run_all.sh --profile ci
+          if command -v dsr >/dev/null 2>&1; then
+            run_gate dsr dsr quality --tool pi_agent_rust
+          else
+            printf 'dsr\t127\tdsr quality --tool pi_agent_rust (command unavailable on hosted runner)\n' >>pr283-evidence/results.tsv
+          fi
+          git rev-parse HEAD >pr283-evidence/head.txt
+          cat pr283-evidence/results.tsv
+      - name: Upload inspectable evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr283-verification-results
+          path: pr283-evidence/
+          retention-days: 30
+      - name: Fail on missing or failed gates
+        if: always()
+        run: |
+          test -f pr283-evidence/results.tsv
+          awk -F '\t' 'NR>1 && $2 != "0" {bad=1; print "Failed:", $1, "exit", $2} END {exit bad}' pr283-evidence/results.tsv
