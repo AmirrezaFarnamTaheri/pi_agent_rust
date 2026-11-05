@@ -70,12 +70,14 @@ mod queued_compaction;
 pub mod session_pins;
 mod settings;
 mod textarea;
+mod transcript_selection;
 pub mod tool_progress;
 mod workspace_commands;
 
 pub use queued_compaction::QueuedCompaction;
 pub use settings::{SettingsKey, SettingsSnapshot};
 use textarea::TextArea;
+use transcript_selection::{Point as TranscriptPoint, Selection as TranscriptSelection};
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -1114,6 +1116,75 @@ fn push_card_block(
     }
 }
 
+/// Install one OSC-8 destination on every displayed piece of a bare URL.
+///
+/// Terminals often auto-detect only the first visual row of a long URL. The
+/// conversation renderer hard-wraps lines, so the link must be attached to
+/// the *span* before wrapping: `Span::split_at_cell` then carries the same
+/// complete destination to every visual row. Preserve existing Markdown link
+/// spans and non-link formatting rather than reparsing the source message.
+fn linkify_visible_urls(line: &ftui::text::Line<'static>) -> ftui::text::Line<'static> {
+    fn fragment(
+        source: &ftui::text::Span<'static>,
+        content: &str,
+        destination: Option<&str>,
+    ) -> ftui::text::Span<'static> {
+        let mut span = source.clone();
+        span.content = content.to_owned().into();
+        span.link = destination.map(|url| url.to_owned().into());
+        if destination.is_some() {
+            span.style = Some(span.style.unwrap_or_else(ftui::Style::new).underline());
+        }
+        span
+    }
+
+    let mut out = Vec::new();
+    for span in line.spans() {
+        if span.link.is_some() {
+            out.push(span.clone());
+            continue;
+        }
+        let text = span.as_str();
+        let mut scan = 0;
+        let mut emitted = 0;
+        while let Some(relative) = text[scan..].find("http") {
+            let start = scan + relative;
+            if !text[start..].starts_with("https://") && !text[start..].starts_with("http://") {
+                scan = start + 4;
+                continue;
+            }
+            let raw_end = text[start..]
+                .find(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '<' | '>' | '"' | '\'' | '`' | '\\')
+                })
+                .map_or(text.len(), |offset| start + offset);
+            let candidate = text[start..raw_end]
+                .trim_end_matches(['.', ',', ';', '!', '?', ')', ']', '}']);
+            // Never let control bytes enter OSC-8 framing, even if the URL
+            // parser would percent-encode them during normalization.
+            let valid = candidate.chars().all(|ch| !ch.is_control())
+                && url::Url::parse(candidate).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                });
+            if !valid {
+                scan = raw_end;
+                continue;
+            }
+            if emitted < start {
+                out.push(fragment(span, &text[emitted..start], None));
+            }
+            out.push(fragment(span, candidate, Some(candidate)));
+            emitted = start + candidate.len();
+            scan = emitted;
+        }
+        if emitted < text.len() || text.is_empty() {
+            out.push(fragment(span, &text[emitted..], None));
+        }
+    }
+    ftui::text::Line::from_spans(out)
+}
+
 /// Render one role block: assistant content as markdown, everything else
 /// with the role prefix on the first line and role style throughout.
 fn push_role_block(
@@ -1125,7 +1196,7 @@ fn push_role_block(
 ) {
     if role == EntryRole::Assistant {
         let rendered = md.render(content);
-        lines.extend(rendered.lines().iter().cloned());
+        lines.extend(rendered.lines().iter().map(linkify_visible_urls));
         return;
     }
     let style = role.style(palette);
@@ -1136,7 +1207,8 @@ fn push_role_block(
         let mut rendered = String::with_capacity(lead.len() + line.len());
         rendered.push_str(lead);
         rendered.push_str(line);
-        lines.push(ftui::text::Line::styled(rendered, style));
+        let row = ftui::text::Line::styled(rendered, style);
+        lines.push(linkify_visible_urls(&row));
     }
     if content.is_empty() {
         lines.push(ftui::text::Line::styled(prefix.to_string(), style));
@@ -1703,6 +1775,8 @@ pub enum UiCommand {
     InitialPrompt,
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
+    /// Refresh provider model catalogs without restarting the session.
+    RefreshModels,
     /// Read effective settings from the live session for `/settings` or F2.
     Settings,
     /// Save one preference, then apply it to the existing live session.
@@ -2085,6 +2159,7 @@ pub struct PiFtuiModel {
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
+    live_model_catalog: Option<Arc<Mutex<Vec<String>>>>,
     /// Display names (`models.json`/catalog `name`) by `provider/model-id`,
     /// shown beside the identity in the `/model` picker (GH #214).
     model_names: HashMap<String, String>,
@@ -2179,6 +2254,8 @@ pub struct PiFtuiModel {
     /// semantics as `follow_stream_tail` in the bubbletea stack, but derived
     /// instead of stored so update() never needs the rendered line count.
     scroll_from_tail: usize,
+    /// Drag selection while the terminal routes mouse events to this UI.
+    transcript_selection: Option<TranscriptSelection>,
     /// Total rendered conversation lines from the last frame. Markdown
     /// rendering expands the raw text (blank lines after blocks, fence
     /// chrome), so the raw-line approximation in `conversation_line_count()`
@@ -2575,6 +2652,7 @@ impl PiFtuiModel {
             settings_snapshot: None,
             settings_pending: false,
             available_models: Vec::new(),
+            live_model_catalog: None,
             model_names: HashMap::new(),
             pending_quit: false,
             restart_request: None,
@@ -2606,6 +2684,7 @@ impl PiFtuiModel {
             term_size_known: false,
             rendered_frame_height: std::cell::Cell::new(0),
             scroll_from_tail: 0,
+            transcript_selection: None,
             rendered_total_lines: std::cell::Cell::new(0),
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
 
@@ -2860,6 +2939,12 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    #[must_use]
+    pub fn with_live_model_catalog(mut self, catalog: Arc<Mutex<Vec<String>>>) -> Self {
+        self.live_model_catalog = Some(catalog);
         self
     }
 
@@ -3665,6 +3750,110 @@ impl PiFtuiModel {
 
     const fn scroll_down(&mut self, lines: usize) {
         self.scroll_from_tail = self.scroll_from_tail.saturating_sub(lines);
+    }
+
+    /// Convert a physical mouse location to an already-wrapped transcript cell.
+    /// Outside-body drags clamp only while a transcript gesture is active.
+    fn transcript_mouse_point(
+        &self,
+        x: u16,
+        y: u16,
+        clamp: bool,
+    ) -> Option<TranscriptPoint> {
+        if self.picker.is_some() || self.custom_overlay_open() || self.settings_pending {
+            return None;
+        }
+        let frame_height = self.rendered_frame_height.get();
+        if frame_height == 0 || self.term.0 == 0 {
+            return None;
+        }
+        let y = if self.alt_screen {
+            y
+        } else {
+            if !self.term_size_known { return None; }
+            let top = self.term.1.saturating_sub(frame_height);
+            if y < top && !clamp { return None; }
+            y.saturating_sub(top)
+        };
+        let areas = layout_regions(
+            Rect::new(0, 0, self.term.0, frame_height),
+            self.input_rows_at_width(self.term.0),
+            u16::from(self.error_banner.is_some()),
+            self.widget_rows(),
+            self.completion_rows(),
+        );
+        let body = areas.body;
+        if body.height == 0 || body.width == 0 {
+            return None;
+        }
+        if !clamp && (y < body.y || y >= body.y.saturating_add(body.height)
+            || x < body.x || x >= body.x.saturating_add(body.width)) {
+            return None;
+        }
+        let transcript = self.conversation_text(body.width);
+        let total = transcript.lines().len();
+        if total == 0 { return None; }
+        let visible = usize::from(body.height);
+        let from_tail = self.scroll_from_tail.min(total.saturating_sub(visible));
+        let offset = total.saturating_sub(visible + from_tail);
+        let body_row = y.saturating_sub(body.y).min(body.height - 1);
+        let row = (offset + usize::from(body_row)).min(total - 1);
+        let cell = usize::from(x.saturating_sub(body.x).min(body.width));
+        Some(TranscriptPoint { row, cell })
+    }
+
+    /// Mouse capture owns body selection; the composer still handles its own
+    /// clicks and drags when this returns false.
+    fn handle_transcript_mouse(&mut self, mouse: &ftui::core::event::MouseEvent) -> bool {
+        use ftui::core::event::MouseButton;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(point) = self.transcript_mouse_point(mouse.x, mouse.y, false) else {
+                    self.transcript_selection = None;
+                    return false;
+                };
+                self.transcript_selection = Some(TranscriptSelection::new(point));
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.transcript_selection.is_some() => {
+                if let Some(point) = self.transcript_mouse_point(mouse.x, mouse.y, true)
+                    && let Some(selection) = &mut self.transcript_selection
+                {
+                    selection.focus = point;
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.transcript_selection.is_some() => {
+                let Some(mut selection) = self.transcript_selection.take() else {
+                    return true;
+                };
+                if let Some(point) = self.transcript_mouse_point(mouse.x, mouse.y, true) {
+                    selection.focus = point;
+                }
+                if !selection.is_empty() {
+                    let areas = layout_regions(
+                        Rect::new(0, 0, self.term.0, self.rendered_frame_height.get()),
+                        self.input_rows_at_width(self.term.0),
+                        u16::from(self.error_banner.is_some()),
+                        self.widget_rows(),
+                        self.completion_rows(),
+                    );
+                    let transcript = self.conversation_text(areas.body.width);
+                    match transcript_selection::selected_text(
+                        transcript.lines(), selection, 256 * 1024
+                    ) {
+                        Some(text) => {
+                            let notice = crate::interactive::copy_text_to_clipboard(&text);
+                            self.push_entry(EntryRole::System, notice);
+                        }
+                        None => self.push_entry(EntryRole::Error,
+                            "Transcript selection is empty or exceeds 256 KiB.".to_string()),
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4874,6 +5063,15 @@ impl PiFtuiModel {
 
     /// `/model` handling: bare opens the picker, `provider/model` switches.
     fn route_model_command(&mut self, spec: &str) {
+        if spec.eq_ignore_ascii_case("refresh") {
+            self.begin_busy("refreshing model catalogs ...");
+            self.send_command(UiCommand::RefreshModels);
+            return;
+        }
+        if let Some(catalog) = &self.live_model_catalog {
+            self.available_models = catalog.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        }
         {
             if spec.is_empty() {
                 // Bare /model opens the picker over the registry list.
@@ -5330,6 +5528,7 @@ impl PiFtuiModel {
                 // mid-turn — the editor gate (`input_active`) already blocks
                 // input while the agent works.
                 self.transcript.clear();
+        self.transcript_selection = None;
                 self.render_cache.borrow_mut().clear();
                 self.streaming.clear();
                 self.thinking.clear();
@@ -6939,8 +7138,9 @@ impl PiFtuiModel {
             }
             Event::Mouse(_) if !self.mouse => {}
             Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_up(3),
-                MouseEventKind::ScrollDown => self.scroll_down(3),
+                MouseEventKind::ScrollUp => { self.transcript_selection = None; self.scroll_up(3); },
+                MouseEventKind::ScrollDown => { self.transcript_selection = None; self.scroll_down(3); },
+                _ if self.handle_transcript_mouse(mouse) => {},
                 _ if self.editor_mouse_active() => {
                     let mut local = *mouse;
                     if !self.alt_screen {
@@ -6969,6 +7169,7 @@ impl PiFtuiModel {
                 // Mouse coordinates belong to the last painted viewport.
                 // Wait for the resized editor to render before using them.
                 self.input.reset_mouse_interaction();
+                self.transcript_selection = None;
                 // Cached blocks are wrapped (issue #227) and their tables
                 // fitted (gh #195) for one width; drop them when it changes.
                 // Height-only resizes keep the cache. `conversation_text`
@@ -7118,6 +7319,7 @@ impl PiFtuiModel {
         self.retire_tool_progress();
         self.current_tool = None;
         self.transcript.clear();
+        self.transcript_selection = None;
         self.render_cache.borrow_mut().clear();
         self.streaming.clear();
         // A resumed conversation's prompts become recallable (up arrow) when
@@ -7378,6 +7580,9 @@ impl PiFtuiModel {
             };
             wrap_body_block(&mut tail, wrap_width, &theme);
             lines.extend(tail);
+        }
+        if let Some(selection) = self.transcript_selection {
+            transcript_selection::highlight(&mut lines, selection, self.palette.accent);
         }
         Text::from_lines(lines)
     }
@@ -9773,6 +9978,40 @@ fn adopt_stored_credentials(
     }
 }
 
+/// Reload provider membership without disturbing the active selection.
+async fn refresh_live_model_registry(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    models: &Arc<Mutex<Vec<String>>>,
+    force: bool,
+) -> crate::error::Result<usize> {
+    let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path())?;
+    let path = crate::models::default_models_path(&crate::config::Config::global_dir());
+    let initial = crate::models::ModelRegistry::load(&auth, Some(path.clone()));
+    if let Some(error) = initial.error() {
+        return Err(crate::error::Error::config(error.to_string()));
+    }
+    let refreshed = crate::providers::model_fetch::sync_ready_model_catalogs(
+        &auth, &initial, &path, force
+    ).await;
+    if refreshed == 0 { return Ok(0); }
+    let mut registry = crate::models::ModelRegistry::load(&auth, Some(path));
+    if let Some(error) = registry.error() {
+        return Err(crate::error::Error::config(error.to_string()));
+    }
+    if let Some(manager) = handle.extension_manager() {
+        let bindings = crate::models::extension_provider_bindings(&manager.extension_providers())?;
+        registry.merge_extension_registry(&bindings, manager.extension_model_entries())?;
+    }
+    let mut available = registry.available_models().into_iter()
+        .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+        .collect::<Vec<_>>();
+    available.sort();
+    available.dedup();
+    handle.session_mut().set_model_registry(registry);
+    *models.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = available;
+    Ok(refreshed)
+}
+
 /// Handle a model switch in the driver, reporting the outcome to the UI.
 async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -11206,6 +11445,8 @@ async fn resume_session_command(
         }
     };
     if same_file {
+        // Reuse this session's held journal only for a reload, never a new identity.
+        options.mutation_recorder = handle.session().agent.mutation_recorder();
         // Preflight wrote a prospective self-reference. Carry its authority
         // into construction so a reload can open that not-yet-retired source.
         options.cost_budget = prepared
@@ -11779,12 +12020,7 @@ pub fn run(
     // an SDK caller. Keep the surface default distinct from an explicit
     // override, so each session reload still honors its fresh configuration.
     session_options.out_default_enabled = true;
-    // One undo history for the process, as on the classic stack. `/new`,
-    // `/resume`, `/reload` and `/fork` rebuild the session from a template
-    // cloned from these options, so every handle shares this recorder.
-    session_options
-        .mutation_recorder
-        .get_or_insert_with(Default::default);
+    // Let the SDK bind the persistent journal to each session identity.
     let bash_cwd = driver_bash_cwd(&session_options);
     if let Some(guard) = &session_options.workspace_trust_guard {
         guard
@@ -11840,7 +12076,9 @@ pub fn run(
     } else {
         cycle_models
     };
-    let driver_available_models = available_models.clone();
+    let mut driver_available_models = available_models.clone();
+    let live_model_catalog = Arc::new(Mutex::new(available_models.clone()));
+    let driver_live_model_catalog = Arc::clone(&live_model_catalog);
     // `/restart`: the UI raises the flag and quits; the driver, once it has
     // saved and shut the session down, records the session file to reopen.
     let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -11997,6 +12235,7 @@ pub fn run(
                 // The `/login` waiting for input, if any (boxed: the driver
                 // future sits near clippy's large_futures threshold).
                 let mut login: Option<Box<DriverLogin>> = None;
+                let mut next_model_sync = Instant::now() + Duration::from_secs(15 * 60);
                 loop {
                     let received = submit_rx.try_recv();
                     if let Ok(command) = &received {
@@ -12051,6 +12290,27 @@ pub fn run(
                                 &driver_turn_control,
                             )
                             .await;
+                        }
+                        Ok(UiCommand::RefreshModels) => {
+                            let result = Box::pin(refresh_live_model_registry(
+                                &mut handle, &driver_live_model_catalog, true,
+                            )).await;
+                            let message = match result {
+                                Ok(count) => PiMsg::System(format!(
+                                    "model catalogs refreshed: {count} provider(s)"
+                                )),
+                                Err(error) => PiMsg::AgentError(format!(
+                                    "model catalog refresh: {error}"
+                                )),
+                            };
+                            let _ = agent_tx.send(message);
+                            let previous_models = std::mem::take(&mut driver_available_models);
+                            driver_available_models = driver_live_model_catalog.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if cycle_models == previous_models {
+                                cycle_models.clone_from(&driver_available_models);
+                            }
+                            next_model_sync = Instant::now() + Duration::from_secs(15 * 60);
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             if run_set_model_command(&mut handle, &provider, &model, &agent_tx).await {
@@ -12607,6 +12867,30 @@ pub fn run(
                             }
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Refresh at most every 15 minutes, only when the
+                            // driver is idle and no credential flow is active.
+                            if Instant::now() >= next_model_sync && login.is_none() {
+                                next_model_sync = Instant::now() + Duration::from_secs(15 * 60);
+                                match Box::pin(refresh_live_model_registry(
+                                    &mut handle, &driver_live_model_catalog, false,
+                                )).await {
+                                    Ok(count) if count > 0 => {
+                            let previous_models = std::mem::take(&mut driver_available_models);
+                            driver_available_models = driver_live_model_catalog.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if cycle_models == previous_models {
+                                cycle_models.clone_from(&driver_available_models);
+                            }
+                                        let _ = agent_tx.send(PiMsg::SystemNote(format!(
+                                            "model catalog updated for {count} provider(s)"
+                                        )));
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => tracing::warn!(
+                                        error = %error, "background model catalog refresh skipped"
+                                    ),
+                                }
+                            }
                             // A browser redirect caught by the login's
                             // localhost callback server completes it without
                             // the user pasting anything.
@@ -12731,6 +13015,7 @@ pub fn run(
         .with_current_ask(current_ask)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
+        .with_live_model_catalog(live_model_catalog)
         .with_model_names(model_names)
         .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
@@ -12961,6 +13246,28 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
         Event::Mouse(MouseEvent::new(kind, x, y))
+    }
+
+    #[test]
+    fn model_refresh_is_an_explicit_ui_command() {
+        let (_agent_tx, agent_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
+        model.route_model_command("refresh");
+        assert_eq!(submit_rx.try_recv(), Ok(UiCommand::RefreshModels));
+        assert!(model.picker.is_none());
+    }
+
+    #[test]
+    fn model_picker_reloads_catalog_during_running_session() {
+        let (_tx, model) = new_model();
+        let shared = Arc::new(Mutex::new(vec!["openai/old-model".to_string()]));
+        let mut model = model.with_live_model_catalog(Arc::clone(&shared));
+        *shared.lock().unwrap() = vec!["openai/new-model".to_string()];
+        model.route_model_command("");
+        let picker = model.picker.as_ref().expect("model picker");
+        assert_eq!(picker.values, vec!["openai/new-model".to_string()]);
+        assert_eq!(model.available_models, vec!["openai/new-model".to_string()]);
     }
 
     fn new_model() -> (mpsc::Sender<PiMsg>, PiFtuiModel) {
@@ -23644,7 +23951,7 @@ mod tests {
             working_directory: Some(cwd.path().to_path_buf()),
             workspace_trusted: true,
             session_dir: Some(sessions.path().to_path_buf()),
-            enabled_tools: Some(Vec::new()),
+            enabled_tools: Some(vec!["write".to_string()]),
             no_context_files: true,
             max_cost: Some(2.0),
             ..crate::sdk::SessionOptions::default()
@@ -23658,6 +23965,13 @@ mod tests {
             ))
             .await
             .expect("source session");
+            let source_recorder = handle.session().agent.mutation_recorder().expect("source undo");
+            let edited = cwd.path().join("undo-scope.txt");
+            std::fs::write(&edited, "before").unwrap();
+            source_recorder.begin_file("scope-edit", "edit", &edited);
+            std::fs::write(&edited, "after").unwrap();
+            source_recorder.commit("scope-edit");
+            assert_eq!(source_recorder.stats().undo_depth, 1);
             let budget = handle.session().agent.cost_budget().unwrap().clone();
             budget.record(0.25).unwrap();
             let mut outstanding = budget.start_attempt().unwrap();
@@ -23688,6 +24002,8 @@ mod tests {
             )
             .await
             .expect("reload before fork");
+            assert!(Arc::ptr_eq(&source_recorder,
+                &handle.session().agent.mutation_recorder().expect("reload undo")));
             assert_eq!(
                 handle
                     .with_session(|session| session.header.id.clone())
@@ -23737,6 +24053,12 @@ mod tests {
                 .unwrap();
             assert_ne!(fork_id, source_id);
             assert_ne!(fork_path, source_path);
+            let fork_recorder = handle.session().agent.mutation_recorder().expect("fork undo");
+            assert!(!Arc::ptr_eq(&source_recorder, &fork_recorder));
+            assert_eq!(fork_recorder.stats().undo_depth, 0);
+            assert!(matches!(fork_recorder.undo(1, false).stopped, Some(crate::undo::UndoStop::Exhausted)));
+            assert_eq!(std::fs::read_to_string(&edited).unwrap(), "after");
+            drop(fork_recorder);
             assert!(
                 handle
                     .session()
@@ -29258,6 +29580,55 @@ mod tests {
                 "width {width}: hard break lost characters: {joined:?}"
             );
         }
+    }
+
+    #[test]
+    fn wrapped_oauth_url_keeps_full_link_target_on_every_visual_row() {
+        // No credentials or real authorization state: only public URL shape.
+        let url = format!(
+            "https://auth.example.test/oauth/authorize?response_type=code&state={}&code_challenge={}",
+            "a".repeat(70),
+            "b".repeat(75)
+        );
+        let line = linkify_visible_urls(&ftui::text::Line::styled(
+            url.clone(),
+            ftui::Style::new(),
+        ));
+        let wrapped = line.wrap(35, WrapMode::WordChar);
+        assert!(wrapped.len() > 2, "URL should span multiple visual rows");
+        let visible: String = wrapped
+            .iter()
+            .flat_map(|row| row.spans())
+            .map(ftui::text::Span::as_str)
+            .collect();
+        assert_eq!(visible, url, "wrapping must not truncate the URL");
+        for row in &wrapped {
+            for span in row.spans().iter().filter(|span| !span.as_str().is_empty()) {
+                assert_eq!(span.link.as_deref(), Some(url.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn linkifier_rejects_control_bytes_in_bare_url() {
+        let malicious = "https://example.test/query?state=good\x1b]8;;https://evil.test";
+        let line = ftui::text::Line::styled(malicious.to_string(), ftui::Style::new());
+        let linked = linkify_visible_urls(&line);
+        assert_eq!(linked.to_plain_text(), malicious);
+        assert!(linked.spans().iter().all(|span| span.link.is_none()));
+    }
+
+    #[test]
+    fn linkifier_keeps_existing_markdown_destination() {
+        let mut explicit = ftui::text::Span::styled("docs", ftui::Style::new());
+        explicit.link = Some("https://docs.example.test/real-target".into());
+        let line = ftui::text::Line::from_spans(vec![explicit]);
+        let linked = linkify_visible_urls(&line);
+        assert_eq!(linked.to_plain_text(), "docs");
+        assert_eq!(
+            linked.spans()[0].link.as_deref(),
+            Some("https://docs.example.test/real-target")
+        );
     }
 
     /// Double-width characters are measured in cells, so a CJK answer must

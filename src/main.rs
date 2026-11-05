@@ -2330,7 +2330,15 @@ async fn run(
     // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit snapshot
     // file content through it so /undo and /redo can roll back. Created before
     // the extension pre-warm so the runtime's hostcall registry shares it.
-    let session_mutation_recorder = Arc::new(pi::undo::FileMutationRecorder::default());
+    let session_mutation_recorder = Arc::new(
+        if !ftui_requested && !cli.no_session && !cli.builtin_tools_disabled()
+            && let Some(session) = startup_session.as_ref()
+        {
+            pi::undo::FileMutationRecorder::for_session(&session.header.id, &workspace.roots())?
+        } else {
+            pi::undo::FileMutationRecorder::default()
+        },
+    );
 
     // One tool registry for the whole session (bd-4t6oz): the extension
     // runtime pre-warmed below and the Agent constructed later resolve tools
@@ -2533,7 +2541,21 @@ async fn run(
     let global_dir = Config::global_dir();
     let package_dir = invocation_path(&Config::package_dir(), &cwd);
     let models_path = default_models_path(&global_dir);
-    let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+    let model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+    // Never block interactive startup on slow model-discovery endpoints. The
+    // already-loaded registry remains usable immediately; the running FTUI
+    // periodically reloads any newly persisted catalog membership.
+    // ACP is independent of the interactive terminal and must not sync here.
+    if startup_is_interactive && !cli.acp {
+        let sync_auth = auth.clone();
+        let sync_registry = model_registry.clone();
+        let sync_models_path = models_path.clone();
+        let _ = runtime_handle.spawn(async move {
+            pi::providers::model_fetch::sync_ready_model_catalogs(
+                &sync_auth, &sync_registry, &sync_models_path, false,
+            ).await
+        });
+    }
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
     }
