@@ -44,7 +44,7 @@ use std::time::Duration;
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
-pub use crate::compaction::ResolvedCompactionSettings;
+pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
 pub use crate::extension_dispatcher::ExtensionUiHandler;
@@ -3687,6 +3687,64 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// Execute a registered command and finish any turns it requests through
+    /// `sendUserMessage` or `sendMessage(..., { triggerTurn: true })`.
+    /// Subscribers, typed hooks and the supplied callback receive those turns
+    /// through the same event fan-out as ordinary SDK prompts. Keep polling
+    /// after requesting cancellation so handler and turn cleanup can finish.
+    pub async fn execute_extension_command_with_abort(
+        &mut self,
+        command_name: &str,
+        args: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Command {
+                name: command_name.to_string(),
+                args: args.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    /// Execute a registered shortcut with the same cancellation, generated
+    /// turns and subscriber delivery as a registered extension command.
+    pub async fn execute_extension_shortcut_with_abort(
+        &mut self,
+        key_id: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Shortcut {
+                key_id: key_id.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_extension_interaction_with_abort(
+        &mut self,
+        interaction: crate::extensions::ExtensionInteraction,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .execute_extension_interaction_with_abort(interaction, timeout_ms, abort, on_event)
+            .await
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session
@@ -4379,19 +4437,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
     let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
-        let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-            ResolvedCompactionSettings::default().context_window_tokens
-        } else {
-            selection.model_entry.model.context_window
-        };
-        ResolvedCompactionSettings {
-            enabled: config.compaction_enabled(),
-            reserve_tokens: config.compaction_reserve_tokens(),
-            keep_recent_tokens: config.compaction_keep_recent_tokens(),
-            context_window_tokens,
-            mode: config.compaction_mode(),
-            render_mode: config.compaction_render_mode(),
-        }
+        config.resolved_compaction_settings(selection.model_entry.model.context_window)
     });
 
     let mut agent_session = AgentSession::new(
@@ -10318,6 +10364,9 @@ printf sdk-owned-command-key
             context_window_tokens: 55_555,
             reserve_tokens: 1_234,
             keep_recent_tokens: 4_321,
+            threshold_tokens: Some(20_000),
+            threshold_percent: Some(50.0),
+            method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
             mode: crate::compaction::AutoCompactionMode::default(),
             render_mode: crate::compaction::CompactionRenderMode::default(),
         };
@@ -10332,19 +10381,50 @@ printf sdk-owned-command-key
         assert_eq!(resolved.context_window_tokens, custom.context_window_tokens);
         assert_eq!(resolved.reserve_tokens, custom.reserve_tokens);
         assert_eq!(resolved.keep_recent_tokens, custom.keep_recent_tokens);
+        assert_eq!(resolved.threshold_tokens, custom.threshold_tokens);
+        assert_eq!(resolved.threshold_percent, custom.threshold_percent);
+        assert_eq!(resolved.method_order, custom.method_order);
+        assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
     #[test]
     fn create_agent_session_derives_compaction_without_override() {
         let tmp = tempdir().expect("tempdir");
-        let options = hermetic_session_options(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".pi")).expect("project config directory");
+        std::fs::write(
+            tmp.path().join(".pi/settings.json"),
+            r#"{"compaction":{
+                "enabled":true,"reserveTokens":1234,"keepRecentTokens":4321,
+                "thresholdTokens":20000,"thresholdPercent":50,
+                "methodOrder":["remote","shake","soft"]
+            }}"#,
+        )
+        .expect("project compaction settings");
+        let options = SessionOptions {
+            workspace_trusted: true,
+            ..hermetic_session_options(tmp.path())
+        };
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let resolved = handle.compaction_settings();
+        assert!(resolved.enabled);
         assert!(
             resolved.context_window_tokens > 0,
             "derived settings must resolve a context window"
         );
+        assert_eq!(resolved.reserve_tokens, 1_234);
+        assert_eq!(resolved.keep_recent_tokens, 4_321);
+        assert_eq!(resolved.threshold_tokens, Some(20_000));
+        assert_eq!(resolved.threshold_percent, Some(50.0));
+        assert_eq!(
+            resolved.method_order,
+            Some(vec![
+                AutoCompactionMethod::Remote,
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ])
+        );
+        assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
     #[test]

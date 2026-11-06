@@ -716,7 +716,26 @@ fn materialize_slot_store(
         match slot.state.as_str() {
             "active" => {}
             "reusable" => {
+                #[cfg(unix)]
                 lease.mark_reusable(&request.owner_agent, HEARTBEAT, reusable_artifacts())?;
+                #[cfg(not(unix))]
+                {
+                    require(
+                        lease.input_identity.is_none(),
+                        "native capture is unavailable",
+                    )?;
+                    require(
+                        lease
+                            .mark_reusable(&request.owner_agent, HEARTBEAT, reusable_artifacts())
+                            .is_err(),
+                        "unsupported native capture cannot publish reusable evidence",
+                    )?;
+                    // Exercise rejection of a persisted historical result on
+                    // platforms that cannot capture new reusable evidence.
+                    lease.state = pi::validation_broker::ValidationSlotState::Reusable;
+                    lease.heartbeat_at_utc = HEARTBEAT.into();
+                    lease.artifacts = reusable_artifacts();
+                }
                 store.append_lease("mark_reusable", HEARTBEAT, &lease)?;
             }
             other => return Err(test_error(format!("unknown fault slot state: {other}"))),
@@ -823,6 +842,34 @@ fn assert_plan_matches_fault_expectation(plan: &Value, scenario: &FaultScenario)
             == Some(0),
         format!("{} plan should not mutate live state", scenario.scenario_id),
     )?;
+    #[cfg(not(unix))]
+    if scenario.expected.decision == "coalesce" {
+        require_eq_str(
+            plan.pointer("/decision/decision").and_then(Value::as_str),
+            "allow",
+            &scenario.scenario_id,
+            "fresh work required without native capture",
+        )?;
+        require(
+            plan.pointer("/decision/reusable_slot")
+                .is_some_and(Value::is_null),
+            "unsupported capture supplies no reusable slot",
+        )?;
+        require(
+            plan.pointer("/decision/coalesced_artifacts")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "unsupported capture supplies no coalesced artifacts",
+        )?;
+        require(
+            plan.pointer("/decision/policy/reusable_equivalent_slots")
+                .and_then(Value::as_u64)
+                == Some(0),
+            "unsupported capture has no reusable candidates",
+        )?;
+        assert_expected_source_statuses(plan, scenario)?;
+        return Ok(());
+    }
     require_eq_str(
         plan.pointer("/decision/decision").and_then(Value::as_str),
         &scenario.expected.decision,
@@ -1288,12 +1335,16 @@ fn validation_broker_fault_corpus_runs_through_cli_doctor_and_runpack() -> TestR
         scenario_artifacts.push(artifacts);
     }
 
-    for required_decision in ["allow", "wait", "coalesce", "narrow", "stale_recover"] {
+    for required_decision in ["allow", "wait", "narrow", "stale_recover"] {
         require(
             seen_decisions.contains(required_decision),
             format!("E2E corpus missing decision {required_decision}"),
         )?;
     }
+    require(
+        seen_decisions.contains("coalesce") == cfg!(unix),
+        "coalescing is observed exactly when native capture is supported",
+    )?;
 
     let events_path = temp.path().join("validation-broker-e2e-events.jsonl");
     write_event_log(&events_path, &e2e_events)?;

@@ -1,7 +1,7 @@
 //! File-mutation recording with `/undo` and `/redo` (bd-cv653.3.13).
 //!
 //! The [`FileMutationRecorder`] snapshots file content around every
-//! successful `write`/`edit`/`hashline_edit`/`ast_edit` tool call so agent
+//! successful `write`/`edit`/`hashline_edit`/`ast_edit`/`lsp` tool call so agent
 //! edits can be rolled back without git. Snapshots live in an in-memory
 //! content-addressed store (dedup by SHA-256) bounded by a byte budget with
 //! oldest-unit eviction. Session-backed recorders also persist a private journal.
@@ -16,7 +16,7 @@
 //! types or a replaced parent directory. Restores replace individual files
 //! atomically; a multi-file unit is not a filesystem transaction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -184,10 +184,10 @@ struct RecorderInner {
 
 /// Records tool-path file mutations and applies `/undo` / `/redo`.
 ///
-/// All methods take `&self`; internal state is mutex-guarded. Recording is
-/// deliberately infallible from the caller's perspective — a snapshot that
-/// cannot be taken degrades to an unrecorded marker instead of failing the
-/// tool call it observes.
+/// All methods take `&self`; internal state is mutex-guarded. An unavailable
+/// snapshot becomes an unrecorded marker. A durable recorder must save that
+/// intent before authorizing a mutation: callers propagate `begin_file` errors
+/// before writing. Post-write persistence errors retain the pending intent.
 #[derive(Debug)]
 pub struct FileMutationRecorder {
     inner: Mutex<RecorderInner>,
@@ -205,6 +205,216 @@ fn snapshot_error(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Keep publication tied to the directory that was validated, even if an
+/// ancestor is renamed while bytes are being staged.
+fn open_directory_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        // Checking only the final component still follows a substituted
+        // ancestor. Walk the canonical path through held directory handles.
+        let absolute = std::path::absolute(path)?;
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let mut directory =
+            std::fs::File::from(rustix::fs::open("/", flags, rustix::fs::Mode::empty())?);
+        for component in absolute.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::Normal(name) => {
+                    directory = std::fs::File::from(rustix::fs::openat(
+                        &directory,
+                        name,
+                        flags,
+                        rustix::fs::Mode::empty(),
+                    )?);
+                }
+                _ => return Err(snapshot_error("undo directory path must be canonical")),
+            }
+        }
+        directory
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            // No delete sharing: retain this directory while publishing.
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(path)?;
+    validate_open_directory(path, &file)?;
+    Ok(file)
+}
+
+fn validate_open_directory(path: &Path, file: &std::fs::File) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || !file.metadata()?.is_dir()
+        || FileIdentity::of_path_nofollow(path)? != FileIdentity::of_open_file(file)?
+    {
+        return Err(snapshot_error("undo parent directory changed"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(snapshot_error("undo parent directory is a reparse point"));
+        }
+    }
+    Ok(())
+}
+
+/// An exclusively created sibling. Unix creation, publication and cleanup all
+/// use the retained directory descriptor instead of re-resolving its pathname.
+struct StagedWrite {
+    #[cfg(unix)]
+    directory: std::fs::File,
+    #[cfg(unix)]
+    name: std::ffi::OsString,
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(unix)]
+    published: bool,
+    #[cfg(not(unix))]
+    temporary: tempfile::NamedTempFile,
+}
+
+impl StagedWrite {
+    fn new(directory: &std::fs::File, parent: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let _ = parent;
+            let directory = directory.try_clone()?;
+            for _ in 0..16 {
+                let name /* ubs:ignore 16 collision retries */ = std::ffi::OsString::from(format!(
+                    ".pi-undo-{}.pending",
+                    uuid::Uuid::new_v4().simple(),
+                ));
+                match rustix::fs::openat(
+                    &directory,
+                    &name,
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::CREATE
+                        | rustix::fs::OFlags::EXCL
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                ) {
+                    Ok(file) => {
+                        return Ok(Self {
+                            directory,
+                            name,
+                            file: std::fs::File::from(file),
+                            published: false,
+                        });
+                    }
+                    Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate an undo staging file",
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            validate_open_directory(parent, directory)?;
+            Ok(Self {
+                temporary: tempfile::NamedTempFile::new_in(parent)?,
+            })
+        }
+    }
+
+    fn file(&self) -> &std::fs::File {
+        #[cfg(unix)]
+        {
+            &self.file
+        }
+        #[cfg(not(unix))]
+        {
+            self.temporary.as_file()
+        }
+    }
+
+    fn file_mut(&mut self) -> &mut std::fs::File {
+        #[cfg(unix)]
+        {
+            &mut self.file
+        }
+        #[cfg(not(unix))]
+        {
+            self.temporary.as_file_mut()
+        }
+    }
+
+    fn persist(self, target: &Path, replace: bool) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut staged = self;
+            let name = target
+                .file_name()
+                .ok_or_else(|| snapshot_error("undo target has no name"))?;
+            if FileIdentity::of_directory_member_nofollow(&staged.directory, &staged.name)?
+                != FileIdentity::of_open_file(&staged.file)?
+            {
+                return Err(snapshot_error("undo staging file changed"));
+            }
+            if replace {
+                rustix::fs::renameat(&staged.directory, &staged.name, &staged.directory, name)?;
+            } else {
+                // A previously absent target must remain absent at publication.
+                // A late creator wins instead of being silently overwritten.
+                rustix::fs::linkat(
+                    &staged.directory,
+                    &staged.name,
+                    &staged.directory,
+                    name,
+                    rustix::fs::AtFlags::empty(),
+                )?;
+                rustix::fs::unlinkat(
+                    &staged.directory,
+                    &staged.name,
+                    rustix::fs::AtFlags::empty(),
+                )?;
+            }
+            staged.published = true;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let result = if replace {
+                self.temporary.persist(target)
+            } else {
+                self.temporary.persist_noclobber(target)
+            };
+            result.map(|_| ()).map_err(|error| error.error)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if !self.published
+            && FileIdentity::of_directory_member_nofollow(&self.directory, &self.name).is_ok_and(
+                |identity| {
+                    FileIdentity::of_open_file(&self.file).is_ok_and(|opened| opened == identity)
+                },
+            )
+        {
+            let _ = rustix::fs::unlinkat(&self.directory, &self.name, rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
 /// Read one sentinel byte beyond the limit, never an unbounded file. The
 /// metadata size is only an early rejection: files can grow after stat.
 fn read_bounded_snapshot(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
@@ -218,7 +428,84 @@ fn read_bounded_snapshot(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-fn read_snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// Read through the parent authority captured for this mutation. Missing
+/// parents can establish absence, but can never authorize a content read.
+fn read_snapshot(path: &Path, parent: Option<&RecordedParent>) -> io::Result<Option<Vec<u8>>> {
+    let Some(parent) = parent else {
+        return match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            _ => Err(snapshot_error("undo snapshot parent was not recorded")),
+        };
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| snapshot_error("undo snapshot file name required"))?;
+    let directory = open_directory_nofollow(&parent.path)?;
+    if FileIdentity::of_open_file(&directory)? != parent.identity {
+        return Err(snapshot_error("undo snapshot parent changed"));
+    }
+    #[cfg(unix)]
+    let content = read_snapshot_in_directory(&directory, name)?;
+    #[cfg(not(unix))]
+    let content = read_snapshot_by_path(&parent.path.join(name))?; // ubs:ignore file_name is one component under an identity-checked parent; durable journals are unsupported on this platform
+    validate_open_directory(&parent.path, &directory)?;
+    Ok(content)
+}
+
+#[cfg(unix)]
+fn read_snapshot_in_directory(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> io::Result<Option<Vec<u8>>> {
+    if Path::new(name).file_name() != Some(name) {
+        return Err(snapshot_error("undo snapshot requires one file name"));
+    }
+    let metadata = match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+    {
+        Ok(metadata) => metadata,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile
+        || u64::try_from(metadata.st_size).unwrap_or(u64::MAX) > MAX_SNAPSHOT_FILE_BYTES
+    {
+        return Err(snapshot_error(
+            "undo snapshots require bounded regular files",
+        ));
+    }
+    let identity = FileIdentity::of_directory_member_nofollow(directory, name)?;
+    // Neither the metadata check nor opening the file re-resolves an ancestor.
+    // NONBLOCK also refuses a raced special file without hanging on a FIFO.
+    let mut file = std::fs::File::from(rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?);
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.len() > MAX_SNAPSHOT_FILE_BYTES
+        || FileIdentity::of_open_file(&file)? != identity
+    {
+        return Err(snapshot_error("undo snapshot file changed during open"));
+    }
+    let content = read_bounded_snapshot(&mut file, MAX_SNAPSHOT_FILE_BYTES)?;
+    let after = file.metadata()?;
+    if FileIdentity::of_directory_member_nofollow(directory, name)? != identity
+        || opened.len() != after.len()
+        || opened.modified().ok() != after.modified().ok()
+        || u64::try_from(content.len()).unwrap_or(u64::MAX) != after.len()
+    {
+        return Err(snapshot_error("undo snapshot file changed during read"));
+    }
+    Ok(Some(content))
+}
+
+#[cfg(not(unix))]
+fn read_snapshot_by_path(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -231,19 +518,6 @@ fn read_snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
     let identity = FileIdentity::of_path_nofollow(path)?;
 
-    // NONBLOCK prevents a regular-file-to-FIFO substitution from hanging
-    // the recorder while its mutex is held. NOFOLLOW rejects final symlinks
-    // at open time, not just during the earlier metadata check.
-    #[cfg(unix)]
-    let mut file = std::fs::File::from(rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )?);
-    #[cfg(not(unix))]
     let mut file = {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -275,12 +549,17 @@ fn read_snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(content))
 }
 
-fn capture_state(store: &mut BlobStore, path: &Path, unrecorded: &mut u64) -> FileState {
-    match read_snapshot(path) {
+fn capture_state(
+    store: &mut BlobStore,
+    path: &Path,
+    parent: Option<&RecordedParent>,
+    unrecorded: &mut u64,
+) -> FileState {
+    match read_snapshot(path, parent) {
         Ok(Some(content)) => FileState::Present(store.insert(content)),
         Ok(None) => FileState::Absent,
         Err(_) => {
-            *unrecorded += 1;
+            *unrecorded = unrecorded.saturating_add(1);
             FileState::Unrecorded
         }
     }
@@ -292,11 +571,9 @@ fn capture_parent(path: &Path) -> io::Result<RecordedParent> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let parent = std::fs::canonicalize(parent)?;
-    if !std::fs::symlink_metadata(&parent)?.is_dir() {
-        return Err(snapshot_error("undo parent is not a directory"));
-    }
+    let directory = open_directory_nofollow(&parent)?;
     Ok(RecordedParent {
-        identity: FileIdentity::of_path_nofollow(&parent)?,
+        identity: FileIdentity::of_open_file(&directory)?,
         path: parent,
     })
 }
@@ -325,12 +602,10 @@ fn validate_mutation_path(file: &FileMutation) -> io::Result<Option<std::fs::Met
 
 /// Current on-disk state matches a recorded state? `Unrecorded` never
 /// matches: units with omitted snapshots refuse replay instead of guessing.
-fn state_matches_disk(state: &FileState, path: &Path) -> bool {
+fn state_matches_disk(state: &FileState, path: &Path, parent: Option<&RecordedParent>) -> bool {
     match state {
-        FileState::Absent => {
-            std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
-        }
-        FileState::Present(id) => read_snapshot(path).is_ok_and(|content| {
+        FileState::Absent => read_snapshot(path, parent).is_ok_and(|content| content.is_none()),
+        FileState::Present(id) => read_snapshot(path, parent).is_ok_and(|content| {
             content.is_some_and(|content| BlobId::from(sha2::Sha256::digest(&content)) == *id)
         }),
         FileState::Unrecorded => false,
@@ -347,7 +622,7 @@ fn snapshot_available(store: &BlobStore, state: &FileState) -> bool {
 
 fn validate_replay_state(file: &FileMutation, expected: &FileState, force: bool) -> io::Result<()> {
     validate_mutation_path(file)?;
-    if !force && !state_matches_disk(expected, &file.path) {
+    if !force && !state_matches_disk(expected, &file.path, file.parent.as_ref()) {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "file changed while preparing undo/redo; no replacement was applied",
@@ -376,9 +651,17 @@ fn restore_file(
         .file_name()
         .ok_or_else(|| snapshot_error("undo target has no file name"))?;
     let target = parent.path.join(name);
+    let directory = open_directory_nofollow(&parent.path)?;
+    if FileIdentity::of_open_file(&directory)? != parent.identity {
+        return Err(snapshot_error(
+            "undo parent directory changed before staging",
+        ));
+    }
     let current_bytes = match expected {
         FileState::Present(id) => store.get(id).map(<[u8]>::to_vec),
-        FileState::Absent | FileState::Unrecorded => read_snapshot(&target).ok().flatten(),
+        FileState::Absent | FileState::Unrecorded => {
+            read_snapshot(&target, Some(parent)).ok().flatten()
+        }
     }
     .unwrap_or_default();
 
@@ -400,10 +683,10 @@ fn restore_file(
                 lines_added: line_count(content),
                 lines_removed: line_count(&current_bytes),
             };
-            let mut staged = tempfile::NamedTempFile::new_in(&parent.path)?;
-            staged.write_all(content)?;
+            let mut staged = StagedWrite::new(&directory, &parent.path)?;
+            staged.file_mut().write_all(content)?;
             if let Some(metadata) = metadata {
-                staged.as_file().set_permissions(metadata.permissions())?;
+                staged.file().set_permissions(metadata.permissions())?;
             } else {
                 // A recreated file gets the write tool's new-file mode, not
                 // the temp file's private 0600.
@@ -411,22 +694,31 @@ fn restore_file(
                 {
                     use std::os::unix::fs::PermissionsExt as _;
                     staged
-                        .as_file()
+                        .file()
                         .set_permissions(std::fs::Permissions::from_mode(0o644))?;
                 }
             }
-            staged.as_file().sync_all()?;
+            staged.file().sync_all()?;
             validate_replay_state(file, expected, force)?;
-            staged.persist(&target).map_err(|error| error.error)?;
+            staged.persist(&target, force || !matches!(expected, FileState::Absent))?;
+            sync_restored_directory(&directory)?;
+            validate_open_directory(&parent.path, &directory)?;
             Ok(report)
         }
         FileState::Absent => {
             validate_replay_state(file, expected, force)?;
-            match std::fs::remove_file(&target) {
+            #[cfg(unix)]
+            let removed = rustix::fs::unlinkat(&directory, name, rustix::fs::AtFlags::empty())
+                .map_err(io::Error::from);
+            #[cfg(not(unix))]
+            let removed = std::fs::remove_file(&target);
+            match removed {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
+            sync_restored_directory(&directory)?;
+            validate_open_directory(&parent.path, &directory)?;
             Ok(RestoredFile {
                 path: file.path.display().to_string(),
                 action: "removed".to_string(),
@@ -436,6 +728,27 @@ fn restore_file(
         }
         FileState::Unrecorded => Err(snapshot_error("undo snapshot was omitted")),
     }
+}
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static FAIL_RESTORE_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sync_restored_directory(directory: &std::fs::File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        if FAIL_RESTORE_DIRECTORY_SYNC.replace(false) {
+            return Err(io::Error::other("injected undo directory sync failure"));
+        }
+        // Publish the workspace directory entry before the journal can claim a
+        // completed restore. A failure keeps the persisted restoring intent.
+        directory.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 #[allow(clippy::naive_bytecount)] // cold path: only runs during /undo reporting
@@ -486,6 +799,9 @@ impl FileMutationRecorder {
         };
         let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
         let inner = &mut *inner;
+        if let Some(error) = inner.durability_error {
+            return Err(io::Error::other(error));
+        }
         let unit = inner
             .pending
             .entry(tool_call_id.to_string())
@@ -494,8 +810,54 @@ impl FileMutationRecorder {
                 at_ms: now_ms(),
                 files: Vec::new(),
             });
-        if unit.files.iter().any(|f| f.path == path) {
-            return;
+        let mut recorded: HashSet<_> = unit.files.iter().map(|file| file.path.clone()).collect();
+        for path in paths {
+            let path = path.as_ref();
+            let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            let parent = capture_parent(&path).ok();
+            let path = if self.journal.is_some() {
+                parent
+                    .as_ref()
+                    .and_then(|parent| path.file_name().map(|name| parent.path.join(name))) // ubs:ignore file_name is one component under the canonical captured parent; journal save independently enforces workspace roots
+                    .unwrap_or_else(|| {
+                        // Missing parents still require the canonical workspace prefix.
+                        path.ancestors()
+                            .skip(1)
+                            .find_map(|ancestor| {
+                                std::fs::canonicalize(ancestor).ok().and_then(|canonical| {
+                                    path.strip_prefix(ancestor)
+                                        .ok()
+                                        .map(|suffix| canonical.join(suffix))
+                                })
+                            })
+                            .unwrap_or_else(|| path.clone())
+                    })
+            } else {
+                path
+            };
+            if !recorded.insert(path.clone()) {
+                continue;
+            }
+            let pre = capture_state(
+                &mut inner.store,
+                &path,
+                parent.as_ref(),
+                &mut inner.unrecorded_files,
+            );
+            unit.files.push(FileMutation {
+                path,
+                parent,
+                pre,
+                post: FileState::Unrecorded,
+            });
+        }
+        enforce_budget(inner, self.budget_bytes);
+        if self.persist(inner, false) {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "Undo intent could not be saved; file mutation was not authorized",
+            ))
         }
         let pre = capture_state(&mut inner.store, &path, &mut inner.unrecorded_files);
         unit.files.push(FileMutation {
@@ -517,7 +879,6 @@ impl FileMutationRecorder {
             return;
         };
         for file in &mut unit.files {
-            file.post = capture_state(&mut inner.store, &file.path, &mut inner.unrecorded_files);
             // A write may have created its parent directories after begin.
             // Never replace an identity that was already recorded, however.
             if file.parent.is_none() {
@@ -529,6 +890,12 @@ impl FileMutationRecorder {
                     file.path = parent.path.join(name);
                 }
             }
+            file.post = capture_state(
+                &mut inner.store,
+                &file.path,
+                file.parent.as_ref(),
+                &mut inner.unrecorded_files,
+            );
         }
         for old_unit in inner.redo_stack.drain(..) {
             release_unit(&mut inner.store, &old_unit);
@@ -538,7 +905,9 @@ impl FileMutationRecorder {
         self.persist(inner, false);
     }
 
-    /// Drop the pending unit for a failed tool call.
+    /// A failed call is discardable only after its pre-state is restored.
+    /// Failed rollback or a post-publication error leaves an explicit gap,
+    /// including across restart, instead of permitting undo through it.
     pub fn abort(&self, tool_call_id: &str) {
         let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
         let inner = &mut *inner;
@@ -624,7 +993,7 @@ impl FileMutationRecorder {
                 let changed: Vec<String> = unit
                     .files
                     .iter()
-                    .filter(|f| !state_matches_disk(&pick(f).0, &f.path))
+                    .filter(|f| !state_matches_disk(&pick(f).0, &f.path, f.parent.as_ref()))
                     .map(|f| f.path.display().to_string())
                     .collect();
                 if !changed.is_empty() {
@@ -823,7 +1192,7 @@ mod tests {
         write(&file, "one\n");
 
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("call-1", "edit", &file);
+        recorder.begin_file("call-1", "edit", &file).unwrap();
         write(&file, "two\n");
         recorder.commit("call-1");
 
@@ -839,12 +1208,46 @@ mod tests {
     }
 
     #[test]
+    fn batch_admission_keeps_first_preimages_across_duplicates_and_later_batches() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let created = dir.path().join("created.txt");
+        write(&first, "original first");
+        write(&second, "original second");
+        let recorder = FileMutationRecorder::default();
+        recorder
+            .begin_files("batch", "lsp", &[&first, &second, &first, &created])
+            .unwrap();
+        write(&first, "intermediate first");
+        recorder
+            .begin_files("batch", "lsp", &[&first, &second])
+            .unwrap();
+        write(&first, "final first");
+        write(&second, "final second");
+        write(&created, "created content");
+        recorder.commit("batch");
+
+        assert_eq!(recorder.stats().undo_depth, 1);
+        let undone = recorder.undo(1, false);
+        assert_eq!(undone.applied.len(), 1);
+        assert_eq!(undone.applied[0].files.len(), 3);
+        assert_eq!(read(&first), "original first");
+        assert_eq!(read(&second), "original second");
+        assert!(!created.exists());
+        assert_eq!(recorder.redo(1, false).applied.len(), 1);
+        assert_eq!(read(&first), "final first");
+        assert_eq!(read(&second), "final second");
+        assert_eq!(read(&created), "created content");
+    }
+
+    #[test]
     fn undo_of_file_creation_removes_and_redo_recreates() {
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("new.txt");
 
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("call-1", "write", &file);
+        recorder.begin_file("call-1", "write", &file).unwrap();
         write(&file, "created\n");
         recorder.commit("call-1");
 
@@ -873,7 +1276,7 @@ mod tests {
         write(&file, "one\n");
 
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("call-1", "edit", &file);
+        recorder.begin_file("call-1", "edit", &file).unwrap();
         write(&file, "two\n");
         recorder.commit("call-1");
 
@@ -899,12 +1302,12 @@ mod tests {
         write(&file, "one\n");
 
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("call-1", "edit", &file);
+        recorder.begin_file("call-1", "edit", &file).unwrap();
         write(&file, "two\n");
         recorder.commit("call-1");
         recorder.undo(1, false);
 
-        recorder.begin_file("call-2", "edit", &file);
+        recorder.begin_file("call-2", "edit", &file).unwrap();
         write(&file, "three\n");
         recorder.commit("call-2");
 
@@ -921,10 +1324,71 @@ mod tests {
         write(&file, "one\n");
 
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("call-1", "edit", &file);
+        recorder.begin_file("call-1", "edit", &file).unwrap();
         recorder.abort("call-1");
         let outcome = recorder.undo(1, false);
         assert!(matches!(outcome.stopped, Some(UndoStop::Exhausted)));
+    }
+
+    #[test]
+    fn pending_mutation_blocks_replay_until_it_is_completed() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("file.txt");
+        write(&file, "before");
+        let recorder = FileMutationRecorder::default();
+        recorder.begin_file("old", "write", &file).unwrap();
+        write(&file, "after");
+        recorder.commit("old");
+        assert_eq!(recorder.undo(1, false).applied.len(), 1);
+        recorder.begin_file("pending", "write", &file).unwrap();
+        for force in [false, true] {
+            assert!(matches!(
+                recorder.undo(1, force).stopped,
+                Some(UndoStop::SnapshotOmitted { .. })
+            ));
+            assert!(matches!(
+                recorder.redo(1, force).stopped,
+                Some(UndoStop::SnapshotOmitted { .. })
+            ));
+            assert_eq!(read(&file), "before");
+        }
+        recorder.abort("pending");
+        assert_eq!(recorder.redo(1, false).applied.len(), 1);
+        assert_eq!(read(&file), "after");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_publication_cannot_be_redirected_by_replacing_the_parent() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("original-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let directory = open_directory_nofollow(&parent).unwrap();
+        let mut staged = StagedWrite::new(&directory, &parent).unwrap();
+        staged.file_mut().write_all(b"restored").unwrap();
+        staged.file().sync_all().unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("file.txt");
+        std::fs::write(&target, "unrelated").unwrap();
+        staged.persist(&target, true).unwrap();
+        assert_eq!(read(&target), "unrelated");
+        assert_eq!(read(&moved.join("file.txt")), "restored");
+        assert!(validate_open_directory(&parent, &directory).is_err());
+    }
+
+    #[test]
+    fn absent_target_publication_never_overwrites_a_late_creator() {
+        let dir = tempdir().unwrap();
+        let parent = std::fs::canonicalize(dir.path()).unwrap();
+        let directory = open_directory_nofollow(&parent).unwrap();
+        let mut staged = StagedWrite::new(&directory, &parent).unwrap();
+        staged.file_mut().write_all(b"restored").unwrap();
+        let target = parent.join("file.txt");
+        std::fs::write(&target, "late external edit").unwrap();
+        assert!(staged.persist(&target, false).is_err());
+        assert_eq!(read(&target), "late external edit");
     }
 
     #[test]
@@ -935,7 +1399,7 @@ mod tests {
 
         let recorder = FileMutationRecorder::default();
         for (id, content) in [("c1", "v2\n"), ("c2", "v3\n"), ("c3", "v4\n")] {
-            recorder.begin_file(id, "edit", &file);
+            recorder.begin_file(id, "edit", &file).unwrap();
             write(&file, content);
             recorder.commit(id);
         }
@@ -960,7 +1424,7 @@ mod tests {
         // must evict the oldest.
         let recorder = FileMutationRecorder::new(3 * 1024);
         for (id, fill) in [("c1", "a"), ("c2", "b"), ("c3", "c")] {
-            recorder.begin_file(id, "edit", &file);
+            recorder.begin_file(id, "edit", &file).unwrap();
             write(&file, &fill.repeat(1024));
             recorder.commit(id);
         }
@@ -1016,10 +1480,10 @@ mod tests {
         write(&b, "same content\n");
 
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("c1", "edit", &a);
+        recorder.begin_file("c1", "edit", &a).unwrap();
         write(&a, "changed a\n");
         recorder.commit("c1");
-        recorder.begin_file("c2", "edit", &b);
+        recorder.begin_file("c2", "edit", &b).unwrap();
         write(&b, "changed b\n");
         recorder.commit("c2");
 
@@ -1055,7 +1519,7 @@ mod tests {
             .set_len(MAX_SNAPSHOT_FILE_BYTES + 1)
             .expect("set sparse size");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("large", "write", &file);
+        recorder.begin_file("large", "write", &file).unwrap();
         write(&file, "replacement");
         recorder.commit("large");
         for force in [false, true] {
@@ -1074,7 +1538,9 @@ mod tests {
     fn directories_are_unrecorded_instead_of_read_as_files() {
         let dir = tempdir().expect("tempdir");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("directory", "edit", dir.path());
+        recorder
+            .begin_file("directory", "edit", dir.path())
+            .unwrap();
         recorder.commit("directory");
         let outcome = recorder.undo(1, true);
         assert!(matches!(
@@ -1091,7 +1557,7 @@ mod tests {
         let file = dir.path().join("a.txt");
         write(&file, "before");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("edit", "edit", &file);
+        recorder.begin_file("edit", "edit", &file).unwrap();
         write(&file, "after");
         recorder.commit("edit");
         recorder.inner.lock().expect("recorder").store.blobs.clear();
@@ -1114,8 +1580,8 @@ mod tests {
         write(&first, "first before");
         write(&second, "second before");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("multi", "edit", &first);
-        recorder.begin_file("multi", "edit", &second);
+        recorder.begin_file("multi", "edit", &first).unwrap();
+        recorder.begin_file("multi", "edit", &second).unwrap();
         write(&first, "first after");
         write(&second, "second after");
         recorder.commit("multi");
@@ -1140,7 +1606,7 @@ mod tests {
         let parent = dir.path().join("new-directory");
         let file = parent.join("new.txt");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("create", "write", &file);
+        recorder.begin_file("create", "write", &file).unwrap();
         std::fs::create_dir(&parent).expect("create parent");
         write(&file, "created");
         recorder.commit("create");
@@ -1148,6 +1614,49 @@ mod tests {
         assert!(!file.exists());
         assert_eq!(recorder.redo(1, false).applied.len(), 1);
         assert_eq!(read(&file), "created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_stay_with_the_held_parent_after_ancestor_substitution() {
+        let directory = tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let ancestor = root.join("ancestor");
+        let moved = root.join("moved");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(ancestor.join("nested")).unwrap();
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        let file = ancestor.join("nested").join("file.txt");
+        let external_file = outside.join("nested").join("file.txt");
+        write(&file, "recorded workspace bytes");
+        write(&external_file, "private outside bytes");
+        let parent = capture_parent(&file).unwrap();
+        let held = open_directory_nofollow(&parent.path).unwrap();
+
+        std::fs::rename(&ancestor, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &ancestor).unwrap();
+
+        // A read already authorized by the held parent cannot follow the new
+        // ancestor. A fresh capture using the historical identity refuses it.
+        assert_eq!(
+            read_snapshot_in_directory(&held, file.file_name().unwrap()).unwrap(),
+            Some(b"recorded workspace bytes".to_vec())
+        );
+        assert!(read_snapshot(&file, Some(&parent)).is_err());
+        assert!(open_directory_nofollow(&parent.path).is_err());
+        let mut store = BlobStore::default();
+        let mut omitted = 0;
+        assert_eq!(
+            capture_state(&mut store, &file, Some(&parent), &mut omitted),
+            FileState::Unrecorded
+        );
+        assert_eq!(
+            capture_state(&mut store, &file, None, &mut omitted),
+            FileState::Unrecorded
+        );
+        assert_eq!(store.bytes, 0);
+        assert_eq!(omitted, 2);
+        assert_eq!(read(&external_file), "private outside bytes");
     }
 
     #[cfg(unix)]
@@ -1165,7 +1674,7 @@ mod tests {
         let _listener = UnixListener::bind(&socket).expect("socket");
         let recorder = FileMutationRecorder::default();
         for (id, path) in [("link", &link), ("socket", &socket)] {
-            recorder.begin_file(id, "edit", path);
+            recorder.begin_file(id, "edit", path).unwrap();
             recorder.commit(id);
         }
         assert_eq!(recorder.stats().unrecorded_files, 4);
@@ -1183,7 +1692,7 @@ mod tests {
         let target = dir.path().join("unrelated.txt");
         write(&file, "before");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("edit", "edit", &file);
+        recorder.begin_file("edit", "edit", &file).unwrap();
         write(&file, "after");
         recorder.commit("edit");
         write(&target, "after");
@@ -1216,7 +1725,7 @@ mod tests {
         let file = dir.path().join("created.txt");
         let target = dir.path().join("must-stay-absent.txt");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("create", "write", &file);
+        recorder.begin_file("create", "write", &file).unwrap();
         write(&file, "created");
         recorder.commit("create");
         assert_eq!(recorder.undo(1, false).applied.len(), 1);
@@ -1248,7 +1757,7 @@ mod tests {
             let file = parent.join("edit.txt");
             write(&file, "before");
             let recorder = FileMutationRecorder::default();
-            recorder.begin_file("edit", "edit", &file);
+            recorder.begin_file("edit", "edit", &file).unwrap();
             write(&file, "after");
             recorder.commit("edit");
             std::fs::rename(&parent, &moved).expect("move original directory");
@@ -1279,7 +1788,7 @@ mod tests {
         let alias = dir.path().join("external-alias.txt");
         write(&file, "before");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("edit", "edit", &file);
+        recorder.begin_file("edit", "edit", &file).unwrap();
         write(&file, "after");
         recorder.commit("edit");
         std::fs::hard_link(&file, &alias).expect("hard link");
@@ -1302,7 +1811,7 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o751))
             .expect("set executable mode");
         let recorder = FileMutationRecorder::default();
-        recorder.begin_file("edit", "edit", &file);
+        recorder.begin_file("edit", "edit", &file).unwrap();
         write(&file, "after\n");
         recorder.commit("edit");
         assert_eq!(recorder.undo(1, false).applied.len(), 1);

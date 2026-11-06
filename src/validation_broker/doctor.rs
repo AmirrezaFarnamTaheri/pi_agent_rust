@@ -694,6 +694,7 @@ mod tests {
     fn reusable_store() -> ValidationSlotStoreSnapshot {
         let mut lease =
             ValidationSlotLease::acquire(request(), START, EXPIRES).expect("acquire test lease");
+        #[cfg(unix)]
         lease
             .mark_reusable(
                 "TestAgent",
@@ -705,6 +706,25 @@ mod tests {
                 }],
             )
             .expect("reusable test lease");
+        #[cfg(not(unix))]
+        {
+            assert!(lease.input_identity.is_none());
+            let artifacts = vec![ValidationSlotArtifact {
+                path: "result.json".into(),
+                sha256: Some("test-result-hash".into()),
+                schema: Some("test_result.v1".into()),
+            }];
+            assert!(
+                lease
+                    .mark_reusable("TestAgent", NOW, artifacts.clone())
+                    .is_err()
+            );
+            // An old cached record is still loadable, but never reusable without
+            // native input identity. Keep authority-rejection tests platform-wide.
+            lease.state = crate::validation_broker::ValidationSlotState::Reusable;
+            lease.heartbeat_at_utc = NOW.into();
+            lease.artifacts = artifacts;
+        }
         ValidationSlotStoreSnapshot {
             schema: VALIDATION_BROKER_SLOT_STORE_SCHEMA.into(),
             status: ValidationSlotStoreStatus::Available,
@@ -804,6 +824,7 @@ mod tests {
         assert_blocked_without_reuse(&decide(&inputs(), &store));
     }
 
+    #[cfg(unix)]
     #[test]
     fn valid_cached_results_still_coalesce_under_capacity_pressure() {
         let mut inputs = inputs();
@@ -815,6 +836,7 @@ mod tests {
         assert_eq!(decision.reusable_slot.as_deref(), Some("cached-validation"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_mail_outage_remains_advisory_for_valid_reuse() {
         let mut inputs = inputs();
@@ -828,6 +850,22 @@ mod tests {
                 .iter()
                 .any(|claim| { claim == "not_permission_to_skip_required_gates" })
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn healthy_doctor_cannot_authorize_legacy_reuse_without_native_capture() {
+        let store = reusable_store();
+        assert!(store.leases[0].input_identity.is_none());
+        let decision = decide(&inputs(), &store);
+        assert_ne!(decision.decision, ValidationAdmissionDecision::Coalesce);
+        assert!(decision.reusable_slot.is_none());
+        assert!(decision.coalesced_artifacts.is_empty());
+        assert!(decision.rejected_reusable_slots.iter().any(|slot| {
+            slot.reasons
+                .iter()
+                .any(|reason| reason == "input_identity_unavailable_or_changed")
+        }));
     }
 
     fn normalize_resource(data: Value) -> ValidationDoctorInput {

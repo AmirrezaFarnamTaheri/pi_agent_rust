@@ -65,6 +65,35 @@ impl FileIdentity {
         })
     }
 
+    /// Identity of one entry in a held directory, without following a symlink.
+    /// The caller supplies a single filename; ancestor renames cannot redirect
+    /// the lookup to a replacement directory.
+    #[cfg(unix)]
+    pub(crate) fn of_directory_member_nofollow(
+        directory: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Self> {
+        if Path::new(name).file_name() != Some(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file identity requires one directory entry name",
+            ));
+        }
+        let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        fn identifier<T>(value: T) -> std::io::Result<u64>
+        where
+            u64: TryFrom<T>,
+        {
+            u64::try_from(value).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "file identity overflow")
+            })
+        }
+        Ok(Self {
+            volume: identifier(metadata.st_dev)?,
+            index: identifier(metadata.st_ino)?,
+        })
+    }
+
     /// Identity of an already-open file, read from the handle itself.
     #[cfg(windows)]
     pub fn of_open_file(file: &std::fs::File) -> std::io::Result<Self> {
