@@ -1,44 +1,52 @@
-name: PR 283 conflict inventory
+name: PR 283 integration candidate
 on:
   push:
     branches:
       - ci/pr283-verification
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
-  inventory:
+  integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
           ref: fix/durable-recovery-links-model-sync
           fetch-depth: 0
-      - name: Attempt merge without committing
+          persist-credentials: true
+      - name: Create non-PR integration candidate
         shell: bash
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/Dicklesworthstone/pi_agent_rust.git
           git fetch upstream main
-          echo "BASE_REF=$(git rev-parse HEAD)"
-          echo "UPSTREAM_REF=$(git rev-parse upstream/main)"
-          git config user.email "actions@users.noreply.github.com"
-          git config user.name "GitHub Actions"
-          git merge --no-commit --no-ff upstream/main || true
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
           mkdir -p conflict-inventory
-          git status --porcelain=v1 > conflict-inventory/status.txt
+          git rev-parse HEAD > conflict-inventory/feature-head.txt
+          git rev-parse upstream/main > conflict-inventory/upstream-head.txt
+          git merge --no-commit --no-ff upstream/main || true
           git diff --name-only --diff-filter=U > conflict-inventory/conflicts.txt
           git ls-files -u > conflict-inventory/stages.txt
           git diff --cc > conflict-inventory/combined.diff
-          echo "=== Unmerged paths ==="
-          cat conflict-inventory/conflicts.txt
-          echo "=== Staged conflicts ==="
-          cat conflict-inventory/stages.txt
-          echo "=== Combined conflict diff ==="
-          head -n 180 conflict-inventory/combined.diff
+          git merge --abort
+          git checkout -b ci/pr283-integration-candidate
+          git merge --no-ff -X ours upstream/main -m "chore: provisional upstream integration for verification"
+          git rev-parse HEAD > conflict-inventory/candidate-head.txt
+          test -z "$(git ls-files -u)"
+          if git show-ref --verify --quiet refs/remotes/origin/ci/pr283-integration-candidate; then
+            git push --force-with-lease=refs/heads/ci/pr283-integration-candidate:$(git rev-parse refs/remotes/origin/ci/pr283-integration-candidate) origin HEAD:refs/heads/ci/pr283-integration-candidate
+          else
+            git push origin HEAD:refs/heads/ci/pr283-integration-candidate
+          fi
+          git status --porcelain=v1 > conflict-inventory/post-status.txt
+          echo "Integration candidate produced from a standard Git -X ours conflict strategy."
+          echo "Not a reviewed resolution; merge correctness must still be checked."
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr283-conflict-inventory
+          name: pr283-integration-candidate-inventory
           path: conflict-inventory/
           retention-days: 7
