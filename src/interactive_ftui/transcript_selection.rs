@@ -56,21 +56,37 @@ pub(super) fn selected_text(
     }
     let mut output = String::new();
     for row in start.row..=end.row {
+        let mut continuation_indent = 0;
         if row > start.row {
-            // A single OSC-8 link split across visual rows is one
-            // continuous destination, not text containing newlines.
+            // Wrapped list items can insert an unlinked indentation span
+            // before the continued OSC-8 link. Ignore only that synthetic
+            // whitespace, not ordinary text between two different links.
             let prior = lines[row - 1].spans().iter().rev()
                 .find(|span| !span.is_empty())
                 .and_then(|span| span.link.as_deref());
-            let next = lines[row].spans().iter()
-                .find(|span| !span.is_empty())
-                .and_then(|span| span.link.as_deref());
-            if prior.is_none() || prior != next {
+            let mut prefix_width = 0;
+            let mut next = None;
+            for span in lines[row].spans() {
+                if span.is_empty() {
+                    continue;
+                }
+                if let Some(link) = span.link.as_deref() {
+                    next = Some(link);
+                    break;
+                }
+                if !span.as_str().chars().all(char::is_whitespace) {
+                    break;
+                }
+                prefix_width += span.width();
+            }
+            if prior.is_some() && prior == next {
+                continuation_indent = prefix_width;
+            } else {
                 output.push('\n');
             }
         }
         let line = &lines[row];
-        let begin = if row == start.row { start.cell } else { 0 };
+        let begin = if row == start.row { start.cell } else { continuation_indent };
         let finish = if row == end.row { end.cell } else { line.width() };
         let mut consumed = 0;
         for span in line.spans() {
@@ -156,6 +172,24 @@ mod tests {
                 assert_eq!(span.link.as_deref(), Some(target));
             }
         }
+    }
+
+    #[test]
+    fn wrapped_list_link_ignores_unlinked_visual_indentation() {
+        let target = "https://example.test/long/path?token=12345";
+        let mut first = ftui::text::Span::raw(target[..21].to_owned());
+        first.link = Some(target.into());
+        let mut second = ftui::text::Span::raw(target[21..].to_owned());
+        second.link = Some(target.into());
+        let rows = vec![
+            Line::from_spans(vec![first]),
+            Line::from_spans(vec![ftui::text::Span::raw("    "), second]),
+        ];
+        let selection = Selection {
+            anchor: Point { row: 0, cell: 0 },
+            focus: Point { row: 1, cell: rows[1].width() },
+        };
+        assert_eq!(selected_text(&rows, selection, 512).as_deref(), Some(target));
     }
 
     #[test]
