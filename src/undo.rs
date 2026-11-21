@@ -486,6 +486,14 @@ impl FileMutationRecorder {
         };
         let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
         let inner = &mut *inner;
+        if self.journal.as_ref().is_some_and(|journal| !journal.contains_path(&path)) {
+            // A tool may legitimately edit a scratch file outside the approved
+            // workspace. Report that the edit is untracked instead of poisoning
+            // the session journal and blocking unrelated in-root undo history.
+            inner.unrecorded_files = inner.unrecorded_files.saturating_add(1);
+            self.persist(inner, false);
+            return;
+        }
         let unit = inner
             .pending
             .entry(tool_call_id.to_string())
