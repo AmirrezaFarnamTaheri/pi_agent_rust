@@ -3995,11 +3995,10 @@ fn build_stream_options_with_optional_key(
     options
 }
 
-/// Create a fully configured embeddable agent session.
-///
-/// This is the programmatic entrypoint for non-CLI consumers that want to run
-/// Pi sessions in-process.
-fn ensure_recorder_session(recorder: &crate::undo::FileMutationRecorder, session_id: &str) -> Result<()> {
+fn ensure_recorder_session(
+    recorder: &crate::undo::FileMutationRecorder,
+    session_id: &str,
+) -> Result<()> {
     if let Some(bound_id) = recorder.journal_session_id()
         && bound_id != session_id
     {
@@ -4008,6 +4007,10 @@ fn ensure_recorder_session(recorder: &crate::undo::FileMutationRecorder, session
     Ok(())
 }
 
+/// Create a fully configured embeddable agent session.
+///
+/// This is the programmatic entrypoint for non-CLI consumers that want to run
+/// Pi sessions in-process.
 pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessionHandle> {
     let mut handle = create_agent_session_deferred_mcp(options).await?;
     handle.activate_mcp().await;
@@ -9579,7 +9582,10 @@ printf sdk-owned-command-key
         ).expect("durable recorder");
         assert!(ensure_recorder_session(&recorder, "session-one").is_ok());
         assert!(ensure_recorder_session(&recorder, "session-two").is_err());
-        assert!(ensure_recorder_session(&crate::undo::FileMutationRecorder::default(), "session-two").is_ok());
+        assert!(
+            ensure_recorder_session(&crate::undo::FileMutationRecorder::default(), "session-two")
+                .is_ok()
+        );
     }
 
     #[test]
