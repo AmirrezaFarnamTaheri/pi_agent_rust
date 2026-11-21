@@ -425,18 +425,32 @@ mod tests {
     }
 
     #[test]
-    fn edits_outside_the_original_roots_do_not_claim_durability() {
+    fn out_of_root_edits_do_not_poison_undo_of_in_root_files() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let path = root.join("journal.json");
-        let recorder = FileMutationRecorder::open_journal(&path,"s",std::slice::from_ref(&root),1024).unwrap();
-        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false));
-        let original = std::fs::read(&path).unwrap();
-        recorder.begin_file("outside", "write", &outside.path().join("file"));
-        assert!(!recorder.stats().durable);
-        assert!(recorder.stats().durability_error.is_some());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let file = root.join("in-root.txt");
+        std::fs::write(&file, "old").unwrap();
+        let recorder = FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024).unwrap();
+        recorder.begin_file("inside", "write", &file);
+        std::fs::write(&file, "new").unwrap();
+        recorder.commit("inside");
+
+        let scratch = outside.path().join("scratch.txt");
+        recorder.begin_file("outside", "write", &scratch);
+        std::fs::write(&scratch, "scratch").unwrap();
+        recorder.commit("outside");
+
+        let stats = recorder.stats();
+        assert!(stats.durable, "a scratch file must not disable durable workspace undo");
+        assert!(stats.durability_error.is_none());
+        assert!(stats.unrecorded_files > 0, "skipped scratch file must be reported");
+        let result = recorder.undo(1, false);
+        assert_eq!(result.applied.len(), 1);
+        assert!(result.stopped.is_none());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(scratch).unwrap(), "scratch");
     }
 
     #[test]
