@@ -376,18 +376,26 @@ fn fault_event_scenario_ids(event_log_path: &str) -> TestResult<BTreeSet<String>
 }
 
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
-    static WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let workspace = WORKSPACE.get_or_init(|| {
-        let root = tempfile::tempdir().expect("fixture workspace").keep();
-        for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
-            std::fs::write(root.join(name), b"validation fixture executable").expect("fixture tool");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)).expect("executable fixture tool");
+    // Each test thread owns and drops its fixture rather than leaking a
+    // process-global temp directory on every test run.
+    thread_local! {
+        static WORKSPACE: std::sync::OnceLock<tempfile::TempDir> = const { std::sync::OnceLock::new() };
+    }
+    let workspace = WORKSPACE.with(|cell| {
+        cell.get_or_init(|| {
+            let root = tempfile::tempdir().expect("fixture workspace");
+            for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+                std::fs::write(root.path().join(name), b"validation fixture executable")
+                    .expect("fixture tool");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(root.path().join(name), std::fs::Permissions::from_mode(0o755))
+                        .expect("executable fixture tool");
+                }
             }
-        }
-        root
+            root
+        }).path().to_path_buf()
     });
     let mut environment = BTreeMap::new();
     environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
