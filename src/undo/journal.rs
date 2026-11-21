@@ -85,6 +85,12 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
 }
 
 impl FileMutationRecorder {
+    /// Return the durable journal's bound session. In-memory recorders are unbound
+    /// and may be reused; durable histories must never follow a different session.
+    pub fn journal_session_id(&self) -> Option<&str> {
+        self.journal.as_ref().map(|journal| journal.session_id.as_str())
+    }
+
     /// Session journals live beside private agent state, never in imported source trees.
     pub fn for_session(session_id: &str, roots: &[PathBuf]) -> io::Result<Self> {
         let directory = crate::config::Config::global_dir().join("undo");
@@ -277,6 +283,17 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         );
+    }
+
+    #[test]
+    fn durable_recorders_expose_ownership_but_in_memory_recorders_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let recorder = FileMutationRecorder::open_journal(
+            &root.join("identity.json"), "original-session", std::slice::from_ref(&root), 1024,
+        ).unwrap();
+        assert_eq!(recorder.journal_session_id(), Some("original-session"));
+        assert_eq!(FileMutationRecorder::default().journal_session_id(), None);
     }
 
     #[test]
