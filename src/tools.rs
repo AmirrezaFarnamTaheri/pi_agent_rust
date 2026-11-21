@@ -1144,6 +1144,25 @@ fn escape_bytes_for_line_output(bytes: &[u8]) -> String {
     escaped
 }
 
+/// Convert a discovered filesystem path into the same portable relative format
+/// accepted by the source-search validator. Never reinterpret an actual Unix
+/// backslash-containing file name as a directory separator.
+fn validator_compatible_find_path(path: &Path) -> Option<String> {
+    let mut names = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = name.to_str()?;
+        if name.contains(['\\', ':']) || name.chars().any(char::is_control) {
+            return None;
+        }
+        names.push(name);
+    }
+    let output = names.join("/");
+    (!output.is_empty() && output.len() <= 4096).then_some(output)
+}
+
 fn path_for_line_output(path: &Path) -> String {
     // Each arm is the function tail on its own platform; only one is ever
     // compiled, so none of them needs an explicit `return`.
@@ -16128,10 +16147,12 @@ fn run_find_output_pipeline(
         let result_limit_reached = entries.len() > effective_limit;
         let paths = structured_paths.then(|| {
             entries.iter().take(effective_limit).filter(|entry| !entry.is_dir)
-                .filter_map(|entry| entry.rel.to_str()).map(str::to_owned).collect::<Vec<_>>()
+                .filter_map(|entry| validator_compatible_find_path(&entry.rel)).collect::<Vec<_>>()
         });
         let path_encoding_skipped = if structured_paths {
-            entries.iter().take(effective_limit).filter(|entry| !entry.is_dir && entry.rel.to_str().is_none()).count()
+            entries.iter().take(effective_limit)
+                .filter(|entry| !entry.is_dir && validator_compatible_find_path(&entry.rel).is_none())
+                .count()
         } else { 0 };
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
@@ -22866,6 +22887,23 @@ mod tests {
             let contents = std::fs::read_to_string(tmp.path().join("new.txt")).unwrap();
             assert_eq!(contents, "hello world");
         });
+    }
+
+    #[test]
+    fn source_discovery_paths_use_portable_slashes_without_reinterpreting_bad_names() {
+        assert_eq!(
+            validator_compatible_find_path(Path::new("src/module.rs")).as_deref(),
+            Some("src/module.rs"),
+        );
+        assert_eq!(validator_compatible_find_path(Path::new("../escape.rs")), None);
+        assert_eq!(validator_compatible_find_path(Path::new("bad:stream.rs")), None);
+        #[cfg(unix)]
+        assert_eq!(validator_compatible_find_path(Path::new("literal\\name.rs")), None);
+        #[cfg(windows)]
+        assert_eq!(
+            validator_compatible_find_path(Path::new(r"src\module.rs")).as_deref(),
+            Some("src/module.rs"),
+        );
     }
 
     #[test]
