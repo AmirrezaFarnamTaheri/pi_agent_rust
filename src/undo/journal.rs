@@ -233,6 +233,13 @@ impl FileMutationRecorder {
 }
 
 impl Journal {
+    /// A journal never records outside its canonical, session-approved roots.
+    pub(super) fn contains_path(&self, path: &Path) -> bool {
+        path.is_absolute()
+            && !path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+            && self.roots.iter().any(|root| path.starts_with(root))
+    }
+
     fn save(&self, inner: &RecorderInner, restoring: bool, budget_bytes: u64) -> io::Result<()> {
         if inner.undo_stack.len() + inner.redo_stack.len() + inner.pending.len() > MAX_UNITS {
             return Err(snapshot_error("undo journal unit limit exceeded"));
