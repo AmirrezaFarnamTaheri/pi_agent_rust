@@ -170,6 +170,115 @@ impl AstLanguage {
 // Shared helpers
 // ============================================================================
 
+/// Bounded syntax evidence for semantic search, using its already privacy-projected source.
+/// Contains syntax containment only; it does not resolve calls, types or imports.
+pub(crate) fn source_outline(path: &Path, source: &str) -> Option<serde_json::Value> {
+    let language = AstLanguage::for_path(path)?;
+    let grep = AstGrep::new(source, language.support_lang());
+    let root = grep.root();
+    let mut symbols = Vec::<serde_json::Value>::new();
+    let mut parents = Vec::<(usize, std::ops::Range<usize>)>::new();
+    let mut partial = false;
+    for node in root.dfs() {
+        if node.kind() == "ERROR" || node.is_missing() {
+            partial = true;
+        }
+        let kind = node.kind();
+        // Python keyword tokens such as the anonymous `class` node are
+        // not declarations and must not consume the outline symbol limit.
+        if kind.as_ref() == "class" && node.field("name").is_none() {
+            continue;
+        }
+        if !matches!(kind.as_ref(),
+            "function_item" | "function_signature_item" | "function_definition" | "function_declaration"
+            | "method_definition" | "method_declaration" | "method"
+            | "struct_item" | "enum_item" | "trait_item" | "impl_item" | "mod_item"
+            | "class_definition" | "class_declaration" | "class"
+            | "interface_declaration" | "type_alias_declaration" | "type_spec"
+            | "use_declaration" | "import_statement" | "import_from_statement"
+            | "import_declaration") {
+            continue;
+        }
+        if symbols.len() == 64 {
+            partial = true;
+            continue;
+        }
+        let range = node.range();
+        while parents.last().is_some_and(|(_, parent)|
+            parent.start > range.start || parent.end < range.end) {
+            parents.pop();
+        }
+        let start = node.start_pos().byte_point().0 + 1;
+        let end = node.end_pos().byte_point();
+        let id = symbols.len();
+        // A node ending at column zero excludes that final line.
+        let end_line = (end.0 + usize::from(end.1 != 0)).max(start);
+        let name = node.field("name").map(|name| name.text().chars().take(160).collect::<String>());
+        symbols.push(serde_json::json!({
+            "id":id,"kind":kind.as_ref(),"name":name,
+            "start_line":start,"end_line":end_line,
+            "parent":parents.last().map(|(id, _)| *id),
+            "provenance":"EXTRACTED"
+        }));
+        parents.push((id, range));
+    }
+    Some(serde_json::json!({"language":language.name(),"symbols":symbols,
+        "partial":partial,"relation":"contains","scope":"file_syntax"}))
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    #[test]
+    fn outline_tracks_real_nested_declarations_and_ignores_strings() {
+        let source = "struct Service;\nimpl Service {\n fn run(&self) { let text = \"fn fake() {}\"; }\n}\n";
+        let outline = source_outline(Path::new("service.rs"), source).unwrap();
+        let symbols = outline["symbols"].as_array().unwrap();
+        assert_eq!(symbols.len(), 3);
+        assert_eq!(symbols[2]["name"], "run");
+        assert_eq!(symbols[2]["parent"], 1);
+        assert_eq!(symbols[2]["start_line"], 3);
+        assert_eq!(symbols[1]["end_line"], 4);
+        assert_eq!(outline["partial"], false);
+        assert!(source_outline(Path::new("unknown.txt"), source).is_none());
+    }
+
+    #[test]
+    fn outline_includes_trait_method_signatures() {
+        let outline = source_outline(
+            Path::new("traits.rs"),
+            "trait Access { fn check(&self); }",
+        ).unwrap();
+        let names = outline["symbols"].as_array().unwrap().iter()
+            .filter_map(|row| row["name"].as_str()).collect::<Vec<_>>();
+        assert!(names.contains(&"Access"), "{outline}");
+        assert!(names.contains(&"check"), "{outline}");
+        assert_eq!(outline["partial"], false);
+    }
+
+    #[test]
+    fn python_class_keyword_does_not_create_a_nameless_symbol() {
+        let outline = source_outline(
+            Path::new("classes.py"),
+            "class Service:\n    def run(self):\n        pass\n",
+        ).unwrap();
+        let symbols = outline["symbols"].as_array().unwrap();
+        assert_eq!(symbols.len(), 2, "{outline}");
+        assert!(symbols.iter().all(|row| row["name"].is_string()), "{outline}");
+    }
+
+    #[test]
+    fn outline_reports_parse_errors_and_item_limit() {
+        let invalid = source_outline(Path::new("file.rs"), "fn broken( {").unwrap();
+        assert_eq!(invalid["partial"], true);
+        let source = (0..65).map(|i| format!("fn f{i}() {{}}\n")).collect::<String>();
+        let outline = source_outline(Path::new("file.rs"), &source).unwrap();
+        assert_eq!(outline["symbols"].as_array().unwrap().len(), 64);
+        assert_eq!(outline["partial"], true);
+    }
+}
+
 /// Resolve a user-supplied path against the tool working directory.
 fn resolve_tool_path(path: &str, cwd: &Path) -> PathBuf {
     let candidate = PathBuf::from(path);

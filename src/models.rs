@@ -885,7 +885,18 @@ pub(crate) struct PreparedModelCatalogProviderConfig {
 
 impl PreparedModelCatalogProviderConfig {
     pub(crate) fn requires_runtime_api_key(&self) -> bool {
-        self.route.auth_header && !has_complete_custom_authorization_header(&self.route.headers)
+        // Native model-list APIs do not use a Bearer Authorization header.
+        // Their separate credential channels still participate in the normal
+        // deferred credential resolver and models.json fallback.
+        let has_header = |wanted: &str| {
+            self.route.headers.keys().chain(self.deferred_headers.keys())
+                .any(|name| name.eq_ignore_ascii_case(wanted))
+        };
+        match self.route.api.as_str() {
+            "anthropic-messages" => !has_header("x-api-key"),
+            "google-generative-ai" => !has_header("x-goog-api-key"),
+            _ => self.route.auth_header && !has_complete_custom_authorization_header(&self.route.headers),
+        }
     }
 
     pub(crate) fn into_route(
@@ -2531,6 +2542,11 @@ fn custom_provider_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
 }
 
 fn provider_has_catalog_route(provider: &str, config: &ProviderConfig) -> bool {
+    // Bedrock discovery uses its regional AWS control-plane endpoint rather
+    // than an inference baseUrl; authentication resolves at request time.
+    if matches!(canonical_provider_id(provider).unwrap_or(provider), "amazon-bedrock" | "google-vertex") {
+        return true;
+    }
     config
         .base_url
         .as_deref()

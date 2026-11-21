@@ -2,10 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
-use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use pi::validation_broker::{
     VALIDATION_BROKER_DECISION_SCHEMA, VALIDATION_BROKER_INPUT_SCHEMA,
@@ -31,38 +28,158 @@ const HEARTBEAT: &str = "2026-05-14T07:05:00Z";
 const EXPIRES: &str = "2026-05-14T07:30:00Z";
 const RENEWED_EXPIRES: &str = "2026-05-14T08:00:00Z";
 const STALE_AT: &str = "2026-05-14T08:30:00Z";
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug)]
+struct TestRoot(tempfile::TempDir);
 
-fn temp_root(label: &str) -> Result<PathBuf, String> {
-    let mut root = std::env::var("TMPDIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
-    root.push("pi_validation_broker_tests");
-    std::fs::create_dir_all(&root).map_err(|err| format!("create temp parent: {err}"))?;
+impl std::ops::Deref for TestRoot {
+    type Target = std::path::Path;
 
-    let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut candidate_name = String::with_capacity(label.len() + 24);
-    for offset in 0..10_000 {
-        candidate_name.clear();
-        candidate_name.push_str(label);
-        candidate_name.push('_');
-        write!(&mut candidate_name, "{}", unique + offset)
-            .map_err(|err| format!("write temp candidate name: {err}"))?;
-        let candidate = root.join(&candidate_name);
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(temp_root_create_error(&err)),
-        }
+    fn deref(&self) -> &Self::Target {
+        self.0.path()
     }
-
-    Err("create temp root: exhausted deterministic candidates".to_string())
 }
 
-fn temp_root_create_error(err: &IoError) -> String {
-    format!("create temp root: {err}")
+fn temp_root(label: &str) -> Result<TestRoot, String> {
+    let mut root = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    root.push("pi_validation_broker_tests");
+    std::fs::create_dir_all(&root).map_err(|error| format!("create temp parent: {error}"))?;
+    tempfile::Builder::new()
+        .prefix(label)
+        .tempdir_in(&root)
+        .map(TestRoot)
+        .map_err(|error| format!("create temp root: {error}"))
+}
+
+#[test]
+fn temporary_test_roots_are_cleaned_up_on_drop() -> TestResult {
+    let root_path = {
+        let root = temp_root("cleanup")?;
+        let path = root.to_path_buf();
+        require(path.is_dir(), "test root exists during its scope")?;
+        path
+    };
+    require(!root_path.exists(), "test root is deleted when its guard drops")
+}
+
+#[test]
+fn reuse_binds_workspace_and_executable_bytes_before_and_after_validation() -> TestResult {
+    let root = temp_root("freshness")?;
+    let tool_root = temp_root("freshness_tool")?;
+    let tool = tool_root.join("validator.exe");
+    std::fs::write(&tool, b"validator v1").map_err(to_string)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).map_err(to_string)?;
+    }
+    let mut request = base_request("freshness");
+    request.cwd = root.to_string_lossy().into_owned();
+    request.command = vec![tool.to_string_lossy().into_owned()];
+    let artifacts = vec![ValidationSlotArtifact {
+        path: "result.json".into(),
+        sha256: Some("result".into()),
+        schema: Some("test.v1".into()),
+    }];
+    for path in ["source.rs", "Cargo.toml", "Cargo.lock"] {
+        let input = root.join(path);
+        std::fs::write(&input, b"original").map_err(to_string)?;
+        let mut lease =
+            ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone())
+            .map_err(to_string)?;
+        require(
+            lease.matches_request_equivalence(&request).map_err(to_string)?,
+            "unchanged bytes reuse",
+        )?;
+        std::fs::write(&input, b"modified").map_err(to_string)?;
+        require(
+            !lease.matches_request_equivalence(&request).map_err(to_string)?,
+            "same HEAD with changed bytes cannot reuse",
+        )?;
+        require(
+            lease.mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()).is_err(),
+            "changed during validation cannot become reusable",
+        )?;
+        std::fs::write(&input, b"original").map_err(to_string)?;
+    }
+    let lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    std::fs::create_dir(root.join("empty_input_directory")).map_err(to_string)?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "empty input directory creation invalidates validation",
+    )?;
+    let mut lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    std::fs::write(&tool, b"validator v2").map_err(to_string)?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "external executable changes cannot reuse",
+    )?;
+    require(
+        lease.mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()).is_err(),
+        "tool changed during validation",
+    )?;
+    let mut legacy = serde_json::to_value(&lease).map_err(to_string)?;
+    legacy
+        .as_object_mut()
+        .ok_or("lease object")?
+        .remove("input_identity");
+    lease = serde_json::from_value(legacy).map_err(to_string)?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "legacy identity cannot reuse",
+    )?;
+    require(
+        lease.mark_reusable("SilentReef", HEARTBEAT, artifacts).is_err(),
+        "legacy identity cannot become reusable",
+    )
+}
+
+#[test]
+fn unavailable_identity_is_never_reusable() -> TestResult {
+    let mut request = base_request("unavailable-identity");
+    request.command = vec!["unavailable-validator".into()];
+    let mut lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    require(
+        lease.input_identity.is_none(),
+        "unresolvable tool has no identity",
+    )?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "unavailable identity fails closed",
+    )?;
+    require(
+        lease.mark_reusable("SilentReef", HEARTBEAT, vec![ValidationSlotArtifact {
+            path: "result.json".into(),
+            sha256: None,
+            schema: None,
+        }]).is_err(),
+        "missing inputs cannot become reusable",
+    )
 }
 
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
+    thread_local! {
+        static WORKSPACE: std::sync::OnceLock<TestRoot> = const { std::sync::OnceLock::new() };
+    }
+    let workspace = WORKSPACE.with(|cell| {
+        cell.get_or_init(|| {
+            let root = temp_root("fixture_workspace").expect("fixture workspace");
+            for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+                std::fs::write(root.join(name), b"validation fixture executable").expect("fixture tool");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755))
+                        .expect("executable fixture tool");
+                }
+            }
+            root
+        }).to_path_buf()
+    });
     let mut environment = BTreeMap::new();
+    environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
     environment.insert(
         "CARGO_TARGET_DIR".to_string(),
         "/data/tmp/pi_agent_rust_cargo/silentreef/target".to_string(),
@@ -85,7 +202,7 @@ fn base_request(slot_id: &str) -> ValidationSlotRequest {
             "--all-targets".to_string(),
         ],
         command_class: "cargo_check".to_string(),
-        cwd: "/data/projects/pi_agent_rust".to_string(),
+        cwd: workspace.to_string_lossy().into_owned(),
         git_head: "cf653c29b5836afabf979bb44325d4712de7088d".to_string(),
         feature_flags: vec!["default".to_string()],
         target_dir: "/data/tmp/pi_agent_rust_cargo/silentreef/target".to_string(),

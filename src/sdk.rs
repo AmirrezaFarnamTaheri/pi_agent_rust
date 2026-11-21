@@ -528,10 +528,12 @@ pub struct SessionOptions {
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
     /// Undo history for the default registry's `write`, `edit` and
-    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
-    /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
-    /// and `/fork`, passes the same recorder so `/undo` keeps working across
-    /// the rebuild, as on the classic stack. [`ExplicitBuiltinTools`] uses it;
+    /// `hashline_edit` (bd-cv653.3.13). `None` opens the session's durable journal
+    /// when persistence is enabled, or an in-memory recorder otherwise. A host
+    /// that rebuilds the same logical session may reuse the recorder. Durable
+    /// recorders are bound to their original session ID and must not be reused
+    /// after `/new`, `/resume` to a different session, or `/fork`; create a
+    /// new recorder for the destination session instead. [`ExplicitBuiltinTools`] uses it;
     /// custom factories can opt in through [`ToolFactoryContext`].
     pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 
@@ -3993,6 +3995,18 @@ fn build_stream_options_with_optional_key(
     options
 }
 
+fn ensure_recorder_session(
+    recorder: &crate::undo::FileMutationRecorder,
+    session_id: &str,
+) -> Result<()> {
+    if let Some(bound_id) = recorder.journal_session_id()
+        && bound_id != session_id
+    {
+        return Err(Error::validation("A durable undo recorder cannot be reused by a different session"));
+    }
+    Ok(())
+}
+
 /// Create a fully configured embeddable agent session.
 ///
 /// This is the programmatic entrypoint for non-CLI consumers that want to run
@@ -4329,8 +4343,20 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         secrets: config.secrets.clone(),
     };
 
+    let session_recorder = if let Some(recorder) = &options.mutation_recorder {
+        ensure_recorder_session(recorder, &session.header.id)?;
+        Arc::clone(recorder)
+    } else if options.no_session || cli.builtin_tools_disabled() {
+        Arc::default()
+    } else {
+        let roots = workspace.as_ref().map_or_else(
+            || vec![cwd.clone()],
+            |workspace| workspace.snapshot_or(&cwd).all(),
+        );
+        Arc::new(crate::undo::FileMutationRecorder::for_session(&session.header.id, &roots)?)
+    };
     let factory_context = ToolFactoryContext {
-        mutation_recorder: options.mutation_recorder.as_ref(),
+        mutation_recorder: Some(&session_recorder),
         workspace: workspace.as_ref(),
         workspace_trusted,
         workspace_trust_guard: options.workspace_trust_guard.as_ref(),
@@ -4346,7 +4372,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
-                Some(options.mutation_recorder.clone().unwrap_or_default()),
+                Some(Arc::clone(&session_recorder)),
                 workspace.as_ref(),
                 workspace_trusted,
                 options.workspace_trust_guard.as_ref(),
@@ -9545,6 +9571,21 @@ printf sdk-owned-command-key
         );
         assert_eq!(handle.model().0, "anthropic");
         assert_eq!(handle.model().1, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn durable_undo_recorder_must_match_current_session_identity() {
+        let tmp = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical root");
+        let recorder = crate::undo::FileMutationRecorder::open_journal(
+            &root.join("session-identity.json"), "session-one", std::slice::from_ref(&root), 1024,
+        ).expect("durable recorder");
+        assert!(ensure_recorder_session(&recorder, "session-one").is_ok());
+        assert!(ensure_recorder_session(&recorder, "session-two").is_err());
+        assert!(
+            ensure_recorder_session(&crate::undo::FileMutationRecorder::default(), "session-two")
+                .is_ok()
+        );
     }
 
     #[test]

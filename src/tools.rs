@@ -1144,6 +1144,25 @@ fn escape_bytes_for_line_output(bytes: &[u8]) -> String {
     escaped
 }
 
+/// Convert a discovered filesystem path into the same portable relative format
+/// accepted by the source-search validator. Never reinterpret an actual Unix
+/// backslash-containing file name as a directory separator.
+fn validator_compatible_find_path(path: &Path) -> Option<String> {
+    let mut names = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = name.to_str()?;
+        if name.contains(['\\', ':']) || name.chars().any(char::is_control) {
+            return None;
+        }
+        names.push(name);
+    }
+    let output = names.join("/");
+    (!output.is_empty() && output.len() <= 4096).then_some(output)
+}
+
 fn path_for_line_output(path: &Path) -> String {
     // Each arm is the function tail on its own platform; only one is ever
     // compiled, so none of them needs an explicit `return`.
@@ -15437,6 +15456,8 @@ struct FindInput {
     pattern: String,
     path: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    structured_paths: bool,
 }
 
 #[derive(Debug)]
@@ -15837,6 +15858,7 @@ impl Tool for FindTool {
         run_find_output_pipeline(
             entries,
             effective_limit,
+            input.structured_paths,
             cache_key,
             &scoped_root,
             &cwd_scope,
@@ -16070,6 +16092,7 @@ impl FindTool {
 fn run_find_output_pipeline(
     mut entries: Vec<FindEntry>,
     effective_limit: usize,
+    structured_paths: bool,
     cache_key: String,
     scoped_root: &ScopedScanRoot,
     cwd_scope: &ScopedScanRoot,
@@ -16122,6 +16145,15 @@ fn run_find_output_pipeline(
         }
 
         let result_limit_reached = entries.len() > effective_limit;
+        let paths = structured_paths.then(|| {
+            entries.iter().take(effective_limit).filter(|entry| !entry.is_dir)
+                .filter_map(|entry| validator_compatible_find_path(&entry.rel)).collect::<Vec<_>>()
+        });
+        let path_encoding_skipped = if structured_paths {
+            entries.iter().take(effective_limit)
+                .filter(|entry| !entry.is_dir && validator_compatible_find_path(&entry.rel).is_none())
+                .count()
+        } else { 0 };
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
         for entry in entries.into_iter().take(effective_limit) {
@@ -16139,6 +16171,10 @@ fn run_find_output_pipeline(
         let mut result_output = std::mem::take(&mut truncation.content);
         let mut notices: Vec<String> = Vec::new();
         let mut details_map = serde_json::Map::new();
+        if let Some(paths) = paths {
+            details_map.insert("paths".to_string(), serde_json::json!(paths));
+            details_map.insert("pathEncodingSkipped".to_string(), serde_json::json!(path_encoding_skipped));
+        }
 
         if result_limit_reached {
             notices.push(format!(
@@ -22851,6 +22887,35 @@ mod tests {
             let contents = std::fs::read_to_string(tmp.path().join("new.txt")).unwrap();
             assert_eq!(contents, "hello world");
         });
+    }
+
+    #[test]
+    fn source_discovery_paths_use_portable_slashes_without_reinterpreting_bad_names() {
+        assert_eq!(
+            validator_compatible_find_path(Path::new("src/module.rs")).as_deref(),
+            Some("src/module.rs"),
+        );
+        assert_eq!(validator_compatible_find_path(Path::new("../escape.rs")), None);
+        assert_eq!(validator_compatible_find_path(Path::new("bad:stream.rs")), None);
+        #[cfg(unix)]
+        assert_eq!(validator_compatible_find_path(Path::new("literal\\name.rs")), None);
+        #[cfg(windows)]
+        assert_eq!(
+            validator_compatible_find_path(Path::new(r"src\module.rs")).as_deref(),
+            Some("src/module.rs"),
+        );
+    }
+
+    #[test]
+    fn find_structured_paths_uses_the_native_camel_case_contract() {
+        let input: FindInput = serde_json::from_value(serde_json::json!({
+            "pattern":"**/*.rs", "structuredPaths":true,
+        })).unwrap();
+        assert!(input.structured_paths);
+        let ordinary: FindInput = serde_json::from_value(serde_json::json!({
+            "pattern":"**/*.rs",
+        })).unwrap();
+        assert!(!ordinary.structured_paths);
     }
 
     /// bd-cv653.3.13: a recorder attached via the builder observes write
